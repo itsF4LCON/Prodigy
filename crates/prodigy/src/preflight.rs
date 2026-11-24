@@ -153,6 +153,24 @@ fn xgameruntime_present() -> bool {
     std::path::Path::new(&root).join("System32").join("xgameruntime.dll").is_file()
 }
 
+/// Dedicated VRAM (MiB) of the hardware adapter `setting` would pick, or `None` for WARP / error.
+pub fn adapter_vram_mib(setting: &str) -> Option<u64> {
+    use crate::gpu::adapter::{self, Selector};
+    use windows::Win32::Graphics::Dxgi::*;
+    let sel = Selector::from_env_or(setting);
+    if sel == Selector::Warp {
+        return None;
+    }
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut list = adapter::candidates(&factory, &sel);
+        if list.is_empty() {
+            list = adapter::candidates(&factory, &Selector::Auto);
+        }
+        list.first().map(|(_, desc)| (desc.DedicatedVideoMemory >> 20) as u64)
+    }
+}
+
 /// Check this PC for a run with the adapter `setting`.
 pub fn run(setting: &str) -> Vec<Check> {
     let found = Found {
