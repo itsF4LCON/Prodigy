@@ -131,12 +131,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opus-pure"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da6dcc20af557d030b6f206e75c764bcda8c28a5bd03c73935c7e8fcf5f4f4a"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prodigy"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "opus-pure",
+ "retour",
+ "serde",
+ "serde_json",
+ "toml",
+ "windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "prodigy-testtitle"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "windows",
 ]
 
 [[package]]
@@ -542,27 +570,6 @@ name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
-
-[[package]]
-name = "xcl"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "retour",
- "serde",
- "serde_json",
- "toml",
- "windows",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "xcl-testtitle"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "windows",
-]
 
 [[package]]
 name = "zmij"
