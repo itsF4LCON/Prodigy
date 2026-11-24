@@ -322,6 +322,8 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     }
     config.exe = exe.strip_prefix(&root).ok().or(exe.file_name().map(Path::new)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let manifest = crate::manifest::load(&root);
+    let vram_mib = crate::preflight::adapter_vram_mib(&config.d3d12_adapter);
+    let auto_series_s = config.apply_vram_profile(vram_mib);
     let from_manifest = config.resolve(manifest.as_ref());
     crate::tls::cleanup_cache(&data_dir.join("cache"));
     let boot = Boot { title: title.clone(), exe_path: exe.clone(), game_root: root.clone(), data_dir: data_dir.clone(), config };
@@ -342,6 +344,12 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     println!("  data:  {}", data_dir.display());
     if !from_manifest.is_empty() {
         println!("  MicrosoftGame.Config: {}", from_manifest.join(", "));
+    }
+    if auto_series_s {
+        println!(
+            "  profile: Xbox Series S (auto-selected for {} MiB VRAM; set device_type = \"anaconda\" in prodigy.toml to override)",
+            vram_mib.unwrap_or(0)
+        );
     }
     match crate::inspect::console_imports(&exe) {
         Some(c) if c.is_empty() => println!(

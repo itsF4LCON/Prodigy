@@ -262,7 +262,7 @@ fn main() {
 
     check("kernelx: GetConsoleType / XSystemGetDeviceType", || unsafe {
         ensure!(GetConsoleType() == 6, "GetConsoleType = {}", GetConsoleType());
-        ensure!(XSystemGetDeviceType() == 7, "device type = {}", XSystemGetDeviceType());
+        ensure!(matches!(XSystemGetDeviceType(), 6 | 7), "device type = {}", XSystemGetDeviceType());
         let mut v = SystemOsVersionInfo { major: 0, minor: 0, build: 0, revision: 0 };
         GetSystemOSVersion(&mut v);
         ensure!(v.major >= 10, "os major {}", v.major);

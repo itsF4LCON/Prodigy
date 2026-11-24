@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// "anaconda" (Series X) or "lockhart" (Series S).
+    /// "auto" (Series S on <= 6 GiB VRAM GPUs, else Series X), "anaconda" (Series X), or "lockhart" (Series S).
     pub device_type: String,
     /// Raw value returned by kernelx `GetConsoleType`. Series values are not public;
     /// this is a guess and can be overridden.
@@ -158,7 +158,7 @@ impl Default for Config {
         // persistent local storage: on the console a folder mounted at the root of a drive
         mounts.insert("S:".into(), PLS_MOUNT_TARGET.into());
         Config {
-            device_type: "anaconda".into(),
+            device_type: "auto".into(),
             console_type_raw: 6,
             gamertag: "Player1".into(),
             user_id: 0x0009_0000_0000_0001,
@@ -192,7 +192,7 @@ impl Default for Config {
 }
 
 const HEADER: &str = "# Prodigy – title configuration. Created automatically; you can edit it.\n\
-# device_type: \"anaconda\" (Series X) or \"lockhart\" (Series S)\n\
+# device_type: \"auto\" (Series S on <= 6 GiB VRAM GPUs, else Series X), \"anaconda\" (Series X), or \"lockhart\" (Series S)\n\
 # mounts: console path prefix -> folder ({game} = game folder, read-only; {data} = Prodigy data)\n\
 # aliases: DLL pattern -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
 # stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
@@ -230,6 +230,35 @@ impl Config {
                 let _ = std::fs::write(path, format!("{HEADER}{body}"));
                 Ok(c)
             }
+        }
+    }
+
+    /// Dedicated VRAM threshold (MiB) at or below which `device_type = "auto"` selects the
+    /// Xbox Series S (`lockhart`) profile to cut texture/render-target VRAM and GPU load.
+    pub const LOW_VRAM_THRESHOLD_MIB: u64 = 6_656;
+
+    /// Resolve `device_type = "auto"` (and optional `PRODIGY_DEVICE_TYPE` override) using the
+    /// selected adapter's dedicated VRAM in MiB. Returns `true` if Series S was auto-selected
+    /// for a low-VRAM GPU.
+    pub fn apply_vram_profile(&mut self, vram_mib: Option<u64>) -> bool {
+        if let Ok(env_dev) = std::env::var("PRODIGY_DEVICE_TYPE") {
+            let trimmed = env_dev.trim();
+            if !trimmed.is_empty() {
+                self.device_type = trimmed.to_string();
+            }
+        }
+        if !self.device_type.eq_ignore_ascii_case("auto") {
+            return false;
+        }
+        if vram_mib.is_some_and(|m| m > 0 && m <= Self::LOW_VRAM_THRESHOLD_MIB) {
+            self.device_type = "lockhart".into();
+            if self.raytracing.eq_ignore_ascii_case("auto") {
+                self.raytracing = "off".into();
+            }
+            true
+        } else {
+            self.device_type = "anaconda".into();
+            false
         }
     }
 
@@ -376,5 +405,23 @@ mod tests {
         assert_eq!(parse_raytracing_tier("tier1_1"), Some(11));
         assert_eq!(parse_raytracing_tier("1.1"), Some(11));
         assert_eq!(parse_raytracing_tier("11"), Some(11));
+    }
+
+    #[test]
+    fn auto_device_type_selects_series_s_on_low_vram_gpus() {
+        let mut low = Config::default();
+        assert!(low.apply_vram_profile(Some(6_031))); // e.g. GTX 1060 6GB
+        assert!(low.is_series_s());
+        assert_eq!(low.raytracing, "off");
+
+        let mut high = Config::default();
+        assert!(!high.apply_vram_profile(Some(12_288)));
+        assert!(!high.is_series_s());
+        assert_eq!(high.raytracing, "auto");
+
+        // Explicit Series X override is preserved even on a low-VRAM GPU.
+        let mut explicit = Config { device_type: "anaconda".into(), ..Config::default() };
+        assert!(!explicit.apply_vram_profile(Some(4_096)));
+        assert!(!explicit.is_series_s());
     }
 }
