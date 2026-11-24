@@ -2433,6 +2433,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
+            ("DispatchMesh", cl_dispatch_mesh as usize),
         ]),
         Kind::DmaList => v.extend_from_slice(&[
             ("Release", cl_release as usize),
@@ -4983,6 +4984,23 @@ unsafe extern "system" fn cl_execute_indirect(
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
+}
+
+/// Original PC `DispatchMesh` function pointer for an adopted command list, if its interface
+/// includes `ID3D12GraphicsCommandList6::DispatchMesh`.
+pub(super) unsafe fn orig_dispatch_mesh(this: *mut c_void) -> Option<unsafe extern "system" fn(*mut c_void, u32, u32, u32)> {
+    let ext = vt(this) as usize;
+    let slot = {
+        let g = CLASSES.lock().unwrap();
+        let c = g.iter().find(|c| c.ext == ext)?;
+        layout::slot(c.iface, "DispatchMesh")?
+    };
+    Some(std::mem::transmute(orig_fn(this, slot)))
+}
+
+unsafe extern "system" fn cl_dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    super::list_x::prepare_draw(this);
+    super::bind::dispatch_mesh(this, x, y, z);
 }
 
 unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {

@@ -400,6 +400,145 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
+/// Vertex count for Pass 2 `DrawInstanced` when emulating a mesh shader via Vertex Shader.
+pub(super) fn emulated_mesh_vertex_count(groups: u32, max_primitives: u32) -> u32 {
+    groups.saturating_mul(max_primitives.max(1)).saturating_mul(3)
+}
+
+/// `ID3D12GraphicsCommandList6::DispatchMesh(x, y, z)` on an adopted command list.
+///
+/// For a translated two-pass console mesh pipeline (`TwoPassPso`), runs Pass 1 (Compute)
+/// into a per-draw `res` buffer in unified memory, inserts a UAV barrier, and then runs
+/// Pass 2 either as a hardware `DispatchMesh` or (on older GPUs without Mesh Shaders /
+/// `PRODIGY_EMULATE_MESH=1`) as `IASetPrimitiveTopology(TRIANGLELIST)` + `DrawInstanced`.
+pub(super) unsafe fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let pso = with(this, |s| s.pso);
+    let real = super::pso_async::resolve_wait(pso);
+    if let Some(tp) = super::real::two_pass_of(real) {
+        match translated_dispatch_mesh(this, real, &tp, x, y, z) {
+            Ok(()) => count(DRAWS),
+            Err(e) => {
+                count(DRAWS_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: DispatchMesh with a two-pass console pipeline skipped: {e}");
+                }
+            }
+        }
+        return;
+    }
+    if super::pso_async::is_pending(pso) {
+        count(DRAWS_SKIPPED);
+        return;
+    }
+    let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+    if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
+        list.SetGraphicsRootSignature(r);
+    }
+    if let Some(pc) = super::real::orig_dispatch_mesh(this) {
+        count(DRAWS_PC);
+        pc(this, x, y, z);
+    }
+}
+
+unsafe fn translated_dispatch_mesh(
+    this: *mut c_void,
+    real_pso: usize,
+    tp: &super::real::TwoPassPso,
+    x: u32,
+    y: u32,
+    z: u32,
+) -> Result<(), String> {
+    let groups = x.saturating_mul(y).saturating_mul(z);
+    if groups == 0 {
+        return Ok(());
+    }
+    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).ok_or("command list")?;
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let windows = super::real::uma_window_vas();
+    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let alloc_uma = |size: usize| -> Result<usize, String> {
+        let p = allocate_upload_memory(this, size.max(16), 256);
+        if p.is_null() {
+            return Err("unified memory is full".into());
+        }
+        Ok(p as usize)
+    };
+    let copy = |bytes: &[u8]| -> Result<usize, String> {
+        let p = alloc_uma(bytes.len())?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+        Ok(p)
+    };
+    let inline = layout.as_ref().map_or(0, |l| l.inline_gfx as usize).min(args.len());
+    let table_at = copy(&args[inline..])?;
+    let mut io = match layout.as_ref() {
+        Some(l) => console_list::user_data_gfx(l, &args, table_at as u64),
+        None => vec![table_at as u32, (table_at >> 32) as u32],
+    };
+    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+    let res_bytes = tp.record.record_dwords().saturating_mul(4).saturating_mul(groups as usize);
+    let res_at = alloc_uma(res_bytes.max(256))?;
+    // Zero the record headers (nv, np) so groups that exit before GS_ALLOC_REQ emit 0 primitives.
+    let stride = tp.record.record_dwords() * 4;
+    for g in 0..groups as usize {
+        std::ptr::write_bytes((res_at + g * stride) as *mut u8, 0, 8);
+    }
+    let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
+    let views: [u64; 6] = [
+        va(io_at),
+        va(res_at),
+        windows.first().copied().unwrap_or(first),
+        windows.get(1).copied().unwrap_or(first),
+        windows.get(2).copied().unwrap_or(first),
+        windows.get(3).copied().unwrap_or(first),
+    ];
+
+    // Pass 1: console MS/NGG program as a Compute Shader into `res`.
+    let compute_rs_ptr = tp.compute_rs as *mut c_void;
+    let compute_rs = ID3D12RootSignature::from_raw_borrowed(&compute_rs_ptr).ok_or("compute root signature")?;
+    let compute_pso_ptr = tp.compute as *mut c_void;
+    let compute_pso = ID3D12PipelineState::from_raw_borrowed(&compute_pso_ptr).ok_or("compute pipeline")?;
+    list.SetComputeRootSignature(compute_rs);
+    for (k, &v) in views.iter().enumerate() {
+        list.SetComputeRootUnorderedAccessView(k as u32, v);
+    }
+    list.SetPipelineState(compute_pso);
+    list.Dispatch(x, y, z);
+
+    // Ensure Pass 1 writes to `res` are visible before Pass 2 reads them.
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+        },
+    };
+    list.ResourceBarrier(&[barrier]);
+
+    // Pass 2: rasterise records via hardware Mesh Shader or emulated Vertex Shader.
+    let mesh_rs_ptr = tp.mesh_rs as *mut c_void;
+    let mesh_rs = ID3D12RootSignature::from_raw_borrowed(&mesh_rs_ptr).ok_or("mesh root signature")?;
+    let mesh_pso_ptr = real_pso as *mut c_void;
+    let mesh_pso = ID3D12PipelineState::from_raw_borrowed(&mesh_pso_ptr).ok_or("mesh pipeline")?;
+    list.SetGraphicsRootSignature(mesh_rs);
+    for (k, &v) in views.iter().enumerate() {
+        list.SetGraphicsRootUnorderedAccessView(k as u32, v);
+    }
+    list.SetPipelineState(mesh_pso);
+    if tp.emulated_vs {
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list.DrawInstanced(emulated_mesh_vertex_count(groups, tp.record.max_primitives), 1, 0, 0);
+    } else if let Some(pc) = super::real::orig_dispatch_mesh(this) {
+        pc(this, groups.saturating_mul(tp.mesh_groups_per_record), 1, 1);
+    } else {
+        return Err("adapter/list has no DispatchMesh and pipeline is not emulated_vs".into());
+    }
+    Ok(())
+}
+
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
 /// arguments are bound (None: the draw is skipped – a console pipeline without a
 /// translation, or no unified memory).
@@ -1279,5 +1418,13 @@ mod tests {
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
         }
+    }
+
+    #[test]
+    fn emulated_mesh_vertex_count_handles_zero_and_caps() {
+        assert_eq!(emulated_mesh_vertex_count(0, 128), 0);
+        assert_eq!(emulated_mesh_vertex_count(2, 0), 6);
+        assert_eq!(emulated_mesh_vertex_count(2, 128), 768);
+        assert_eq!(emulated_mesh_vertex_count(u32::MAX, 128), u32::MAX);
     }
 }
