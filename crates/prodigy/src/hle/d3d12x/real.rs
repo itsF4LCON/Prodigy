@@ -4260,12 +4260,16 @@ pub struct TwoPassPso {
     /// compute pipeline state, owned here, and its root signature (static samplers)
     pub compute: usize,
     pub compute_rs: usize,
+    /// optional GPU triangle compaction compute PSO (owned here; non-zero when `emulated_vs`)
+    pub compact: usize,
+    /// cached `ID3D12CommandSignature` for `D3D12_INDIRECT_ARGUMENT_TYPE_DRAW` (stride 16)
+    pub draw_cmd_sig: usize,
     /// root signature of the mesh / emulated-VS pipeline (the title's PSO; its PS's static samplers)
     pub mesh_rs: usize,
     pub record: crate::gpu::recomp::MsInterface,
     /// DispatchMesh groups per record (see `pso::TwoPass`)
     pub mesh_groups_per_record: u32,
-    /// true when pass 2 is an emulated Vertex Shader (`DrawInstanced`) rather than a hardware Mesh Shader
+    /// true when pass 2 is an emulated Vertex Shader (`ExecuteIndirect` / `DrawInstanced`) rather than a hardware Mesh Shader
     pub emulated_vs: bool,
     /// "MS" or "GS"
     pub kind: &'static str,
@@ -4273,9 +4277,42 @@ pub struct TwoPassPso {
 
 impl Drop for TwoPassPso {
     fn drop(&mut self) {
-        // the compute pipeline state is Prodigy's (the root signatures are cached or the title's)
+        // the compute pipeline states are Prodigy's (the root signatures and command signature are cached)
         super::pso_async::release(self.compute);
+        if self.compact != 0 {
+            super::pso_async::release(self.compact);
+        }
     }
+}
+
+/// Cached `ID3D12CommandSignature` for `D3D12_INDIRECT_ARGUMENT_TYPE_DRAW` (16-byte stride),
+/// used by compacted emulated Mesh Shaders (`bind::dispatch_mesh`).
+static DRAW_CMD_SIGS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+unsafe fn draw_command_signature(device: *mut c_void) -> usize {
+    if device.is_null() {
+        return 0;
+    }
+    let key = device as usize;
+    if let Some(&sig) = DRAW_CMD_SIGS.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return sig;
+    }
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return 0 };
+    let arg_desc = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, ..Default::default() };
+    let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 16,
+        NumArgumentDescs: 1,
+        pArgumentDescs: &arg_desc,
+        NodeMask: 0,
+    };
+    let mut out: Option<ID3D12CommandSignature> = None;
+    if dev.CreateCommandSignature(&sig_desc, None, &mut out).is_err() {
+        return 0;
+    }
+    let Some(sig) = out else { return 0 };
+    let raw = sig.into_raw() as usize;
+    DRAW_CMD_SIGS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, raw);
+    raw
 }
 
 static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);
@@ -4391,11 +4428,24 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         *ppv = std::ptr::null_mut();
         return E_INVALIDARG;
     }
+    let mut compact: *mut c_void = std::ptr::null_mut();
+    let mut draw_cmd_sig = 0usize;
+    if let Some(comp_dxil) = &tp.compact_cs {
+        let mut comp_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        comp_desc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+        comp_desc.CS = bytecode(comp_dxil);
+        let hcomp = fc(this, &comp_desc as *const _ as *const c_void, &iid, &mut compact);
+        if hcomp < 0 || compact.is_null() {
+            compact = std::ptr::null_mut();
+        } else {
+            draw_cmd_sig = draw_command_signature(this);
+        }
+    }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, emulated_vs: tp.emulated_vs, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, compact: compact as usize, draw_cmd_sig, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, emulated_vs: tp.emulated_vs, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        let p2 = if tp.emulated_vs { "emulated VS" } else { "mesh" };
+        let p2 = if tp.emulated_vs { "compacted emulated VS" } else { "mesh" };
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + {p2} {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr

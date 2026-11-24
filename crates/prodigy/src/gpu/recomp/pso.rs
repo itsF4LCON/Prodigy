@@ -523,7 +523,9 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
 pub struct TwoPass {
     /// compute pass (cs_6_6 DXIL)
     pub cs: Vec<u8>,
-    /// pass-through rasterisation shader (`ms_6_6` DXIL when `!emulated_vs`, `vs_6_6` DXIL when `emulated_vs`)
+    /// optional GPU triangle compaction compute pass (cs_6_6 DXIL, used when `emulated_vs` is true)
+    pub compact_cs: Option<Vec<u8>>,
+    /// pass-through rasterisation shader (`ms_6_6` DXIL when `!emulated_vs`, compacted `vs_6_6` DXIL when `emulated_vs`)
     pub ms: Vec<u8>,
     /// true when the GPU lacks hardware Mesh Shaders (or `PRODIGY_EMULATE_MESH=1`) and pass 2 is a VS
     pub emulated_vs: bool,
@@ -542,15 +544,16 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let (ms, mesh_groups_per_record) = if emulate_vs {
-        let vs = dxc::compile_cached(&super::emit::vertex_passthrough_for(&record, ps_inputs.as_deref()), "main", "vs_6_6")?.0;
-        (vs, 1)
+    let (compact_cs, ms, mesh_groups_per_record) = if emulate_vs {
+        let comp = dxc::compile_cached(&super::emit::mesh_compact_cs(&record), "main", "cs_6_6")?.0;
+        let vs = dxc::compile_cached(&super::emit::vertex_passthrough_compacted_for(&record, ps_inputs.as_deref()), "main", "vs_6_6")?.0;
+        (Some(comp), vs, 1)
     } else {
         let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
         let split = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-        (ms, split)
+        (None, ms, split)
     };
-    Ok(TwoPass { cs, ms, emulated_vs: emulate_vs, record, mesh_groups_per_record, samplers: t.static_samplers })
+    Ok(TwoPass { cs, compact_cs, ms, emulated_vs: emulate_vs, record, mesh_groups_per_record, samplers: t.static_samplers })
 }
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what

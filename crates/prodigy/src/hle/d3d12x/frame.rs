@@ -192,12 +192,31 @@ fn with<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
     f(c)
 }
 
+/// Effective frame interval after applying optional `max_fps` / `PRODIGY_MAX_FPS` cap.
+pub fn clamp_interval_us(len_us: u32, max_fps: u32) -> u32 {
+    if len_us == 0 || max_fps == 0 {
+        return len_us;
+    }
+    let min_us = 1_000_000u32 / max_fps.max(1);
+    len_us.max(min_us)
+}
+
+fn effective_max_fps() -> u32 {
+    if let Ok(v) = std::env::var("PRODIGY_MAX_FPS") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            return n;
+        }
+    }
+    crate::state::config().max_fps
+}
+
 /// device #78 SetFrameIntervalX(output, length µs, periodicity, flags)
 pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void, _output: *mut std::ffi::c_void, len_us: u32, periodicity: u32, flags: u32) -> HRESULT {
     if len_us != 0 && !interval_valid(len_us, high_refresh()) {
         crate::xlog_warn!("D3D12.X: SetFrameIntervalX({len_us} µs) – not an interval of this display");
         return E_INVALIDARG;
     }
+    let len_us = clamp_interval_us(len_us, effective_max_fps());
     with(|c| {
         if c.interval_us != len_us {
             c.kinds[0].scheduled = false;
@@ -625,6 +644,15 @@ mod tests {
             assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut t), S_OK);
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
         }
+    }
+
+    #[test]
+    fn clamp_interval_us_caps_frame_rate() {
+        assert_eq!(clamp_interval_us(16_667, 0), 16_667);
+        assert_eq!(clamp_interval_us(0, 30), 0);
+        assert_eq!(clamp_interval_us(16_667, 30), 33_333);
+        assert_eq!(clamp_interval_us(33_333, 30), 33_333);
+        assert_eq!(clamp_interval_us(50_000, 30), 50_000);
     }
 }
 
