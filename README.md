@@ -1,6 +1,6 @@
 # Prodigy
 
-**Prodigy** is an Xbox Series X|S (GDK) → Windows compatibility layer that runs unpacked console games you own natively on x64 Windows—no CPU emulation. Console system libraries (`kernelx.dll`, `XGameRuntime`, `d3d12_xs.dll`, etc.) are implemented in Rust, and RDNA2 GPU shaders are recompiled to `HLSL` → `DXIL`.
+**Prodigy** is an Xbox Series X|S (GDK) → Windows compatibility layer that runs unpacked console games you own natively on x64 Windows—**including on older GPUs without hardware Mesh Shaders** (such as NVIDIA GTX 10-series and AMD RX 500 / 5000). There is no CPU emulation: console system libraries (`kernelx.dll`, `XGameRuntime`, `d3d12_xs.dll`, etc.) are implemented in Rust, and RDNA2 GPU shaders are recompiled to `HLSL` → `DXIL` with automatic Vertex Shader mesh emulation and Wave64-on-Wave32 support.
 
 > Independent continuation of [XCL](https://github.com/ivall/xcl), incorporating select components from [VIctory](https://github.com/Marvisak/VIctory).  
 > **Legal:** Works only on unpacked game files you already own. Contains no console SDK code, keys, assets, or DRM circumvention.
@@ -17,6 +17,7 @@
 
 ## Highlights
 
+- **Older GPU Support:** Automatic Vertex Shader (`vs_6_6`) emulation fallback for console NGG/Mesh/GS pipelines on pre-Mesh-Shader SM 6.6 GPUs (GTX 10-series, RX 500/5000, etc.), plus Wave64-on-Wave32 splitting (`PRODIGY_EMULATE_MESH=1` to force fallback).
 - **Native Execution & VFS:** PE loader, `kernelx` memory/threading, DirectStorage (`zlib` + `BCPack`), and a copy-on-write VFS overlay (`GAME:`, `S:\`, `T:\`) that never modifies your game folder.
 - **D3D12.X & Shaders:** RDNA2 → DXIL recompiler (VS/PS/CS/GS/Mesh NGG, wave64-on-wave32, ray tracing, disk cache), async PSO creation, GFX10 texture deswizzling, `XboxBvhBuilder`, and FSR 4.
 - **Audio & Video:** XAudio2.9 routing, pure-Rust XMA1/XMA2, Opus (`MSOpusDecoder.dll` / `libopus` / built-in `opus-pure` fallback), Bink 2, and a local-only Media Foundation source resolver proxy.
@@ -25,7 +26,7 @@
 ## Requirements & Build
 
 - **Windows 10 (22H2+) / Windows 11 x64**, Rust (`stable-x86_64-pc-windows-msvc`)
-- **D3D12 GPU** with Shader Model 6.6 & Mesh Shaders (Windows 10: place Agility SDK `D3D12Core.dll` in `D3D12\` next to `prodigy.exe` or set `PRODIGY_D3D12_DIR`)
+- **D3D12 GPU** with Shader Model 6.6 (older pre-Mesh-Shader GPUs such as NVIDIA GTX 10-series / AMD RX 500 & 5000 automatically use the Vertex Shader mesh-emulation fallback; Windows 10: place Agility SDK `D3D12Core.dll` in `D3D12\` next to `prodigy.exe` or set `PRODIGY_D3D12_DIR`)
 - **DXC 1.8+** (`dxcompiler.dll` + `dxil.dll`, set `PRODIGY_DXC_DIR` to `bin\x64`)
 
 ```powershell

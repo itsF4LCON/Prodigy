@@ -437,6 +437,18 @@ fn wave32_only(device: *mut c_void) -> bool {
     }
 }
 
+/// True when `device` lacks hardware D3D12 Mesh Shaders (e.g. GTX 10-series, RX 500/5000) or
+/// `PRODIGY_EMULATE_MESH=1` is set, so pass 2 uses the Vertex Shader fallback.
+fn emulate_mesh(device: *mut c_void) -> bool {
+    if device.is_null() {
+        return false;
+    }
+    unsafe {
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return false };
+        !crate::gpu::recomp::pso::mesh_shaders_for_device(dev)
+    }
+}
+
 /// A wave64 VS / PS may run in 32-lane waves here (`pso::graphics_wave32`: the driver picks
 /// the wave size of graphics shaders): the split flag for VS / PS translation. Unknown
 /// device: assume so.
@@ -4247,11 +4259,13 @@ pub struct TwoPassPso {
     /// compute pipeline state, owned here, and its root signature (static samplers)
     pub compute: usize,
     pub compute_rs: usize,
-    /// root signature of the mesh pipeline (the title's PSO; its PS's static samplers)
+    /// root signature of the mesh / emulated-VS pipeline (the title's PSO; its PS's static samplers)
     pub mesh_rs: usize,
     pub record: crate::gpu::recomp::MsInterface,
     /// DispatchMesh groups per record (see `pso::TwoPass`)
     pub mesh_groups_per_record: u32,
+    /// true when pass 2 is an emulated Vertex Shader (`DrawInstanced`) rather than a hardware Mesh Shader
+    pub emulated_vs: bool,
     /// "MS" or "GS"
     pub kind: &'static str,
 }
@@ -4377,10 +4391,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, emulated_vs: tp.emulated_vs, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+        let p2 = if tp.emulated_vs { "emulated VS" } else { "mesh" };
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + {p2} {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr
 }
@@ -4388,7 +4403,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_mesh, is_console};
+    use crate::gpu::recomp::pso::is_console;
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
     }
@@ -4423,7 +4438,8 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
+    let use_vs = emulate_mesh(this);
+    let (tp, (ps, ps_samplers)) = match (crate::gpu::recomp::pso::console_mesh_for(ms, ps, wave32_only(this), use_vs), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -4438,12 +4454,17 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     // the title's state (blend, rasteriser, depth, formats …) with Prodigy's RS and shaders
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    if tp.emulated_vs {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &tp.ms);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    } else {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    }
     if let Some(p) = &ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [0, 2, 19, 24, 25].contains(ty) || (tp.emulated_vs && (*ty == 1 || *ty == 14)); // RS, PS, cached PSO, AS, MS (+ VS/topology when emulated)
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -4465,8 +4486,9 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let use_vs = emulate_mesh(this);
     let (tp, (ps, ps_samplers)) = match (
-        crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
+        crate::gpu::recomp::pso::console_geometry_for(vs, gs, shader_bytes(&d.PS), wave32_only(this), use_vs),
         two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
@@ -4513,7 +4535,12 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    if tp.emulated_vs {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &tp.ms);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    } else {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    }
     if let Some(p) = &ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
