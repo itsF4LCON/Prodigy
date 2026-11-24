@@ -25,7 +25,7 @@
 ## Requirements & Build
 
 - **Windows 10 (22H2+) / Windows 11 x64**, Rust (`stable-x86_64-pc-windows-msvc`)
-- **D3D12 GPU** with Shader Model 6.6 & Mesh Shaders (Windows 10: place Agility SDK `D3D12Core.dll` in `D3D12\` next to `prodigy.exe` or set `PRODIGY_D3D12_DIR`)
+- **D3D12 GPU** with Shader Model 6.6 (older pre-Mesh-Shader GPUs such as NVIDIA GTX 10-series / AMD RX 500 & 5000 automatically use the Vertex Shader mesh-emulation fallback; Windows 10: place Agility SDK `D3D12Core.dll` in `D3D12\` next to `prodigy.exe` or set `PRODIGY_D3D12_DIR`)
 - **DXC 1.8+** (`dxcompiler.dll` + `dxil.dll`, set `PRODIGY_DXC_DIR` to `bin\x64`)
 
 ```powershell

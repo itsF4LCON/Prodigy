@@ -2899,6 +2899,90 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// Emulated Mesh Shader fallback (Vertex Shader pass 2) end-to-end on any SM 6.6 GPU,
+/// including pre-Mesh-Shader GPUs such as NVIDIA Pascal (GTX 10-series).
+#[test]
+fn gpu_mesh_mode_two_passes_emulated_vs() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, vertex_passthrough, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)),
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None));
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let pass = vertex_passthrough(&ms);
+    let vsb = dxc::compile(&pass, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let mut mem = vec![0u32; 256];
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    let (px, rec) = runner::mesh_draw_emulated(&cs, &vsb, &ps, 2, ms.max_primitives, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    for g in 0..2usize {
+        let r = &rec[g * rd..(g + 1) * rd];
+        assert_eq!((r[0], r[1]), (3, 1), "group {g}: GS_ALLOC_REQ counts");
+        assert_eq!(r[MESH_HEADER + 128 * vd], 1 << 10 | 2 << 20, "group {g} primitive");
+    }
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    assert_eq!((at(3, 29)[0], at(3, 29)[3]), (0.0, 1.0), "group 0 triangle (left)");
+    assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "group 1 triangle (right)");
+    assert_eq!(at(29, 3), [-1.0; 4], "outside both triangles");
+
+    // 16-input PS also works directly without splitting
+    let ins: Vec<crate::gpu::dxbc::SigElement> = (0..16).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
+    let pass16 = super::emit::vertex_passthrough_for(&ms, Some(&ins));
+    let vsb16 = dxc::compile(&pass16, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
+    let fields: String = (0..16).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
+    let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
+    let (px16, _) = runner::mesh_draw_emulated(&cs, &vsb16, &ps16, 2, ms.max_primitives, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert!(px16 == px, "emulated VS 16-input pass-through draws the same pixels");
+}
+
 /// DXC optimisation levels on a saved HLSL file (`PRODIGY_TIME_HLSL=path`, profile in `PRODIGY_TIME_PROFILE`).
 #[test]
 #[ignore]

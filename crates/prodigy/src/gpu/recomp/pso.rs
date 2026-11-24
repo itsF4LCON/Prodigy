@@ -523,8 +523,10 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
 pub struct TwoPass {
     /// compute pass (cs_6_6 DXIL)
     pub cs: Vec<u8>,
-    /// pass-through mesh shader (ms_6_6 DXIL)
+    /// pass-through rasterisation shader (`ms_6_6` DXIL when `!emulated_vs`, `vs_6_6` DXIL when `emulated_vs`)
     pub ms: Vec<u8>,
+    /// true when the GPU lacks hardware Mesh Shaders (or `PRODIGY_EMULATE_MESH=1`) and pass 2 is a VS
+    pub emulated_vs: bool,
     pub record: super::MsInterface,
     /// mesh groups of the pass-through per record (> 1: the record is over D3D12's mesh
     /// output limit and goes out in runs of triangles)
@@ -533,21 +535,33 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
-fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>, emulate_vs: bool) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
+    let (ms, mesh_groups_per_record) = if emulate_vs {
+        let vs = dxc::compile_cached(&super::emit::vertex_passthrough_for(&record, ps_inputs.as_deref()), "main", "vs_6_6")?.0;
+        (vs, 1)
+    } else {
+        let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+        let split = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+        (ms, split)
+    };
+    Ok(TwoPass { cs, ms, emulated_vs: emulate_vs, record, mesh_groups_per_record, samplers: t.static_samplers })
 }
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_mesh_for(blob, ps, split_wave64, false)
+}
+
+/// `console_mesh` with explicit Vertex Shader emulation fallback (`emulate_vs = true` on GPUs
+/// without hardware Mesh Shaders).
+pub fn console_mesh_for(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, emulate_vs: bool) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -555,7 +569,7 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, mem_windows())?, record, ps)
+    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, mem_windows())?, record, ps, emulate_vs)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -602,12 +616,42 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
     split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
+/// `PRODIGY_EMULATE_MESH=1`: force the Vertex Shader fallback for console mesh / NGG / GS
+/// pipelines even on GPUs with hardware Mesh Shaders (useful for testing older-GPU paths).
+pub fn emulate_mesh_forced() -> bool {
+    std::env::var("PRODIGY_EMULATE_MESH").is_ok_and(|v| v == "1")
+}
+
+/// Whether `device` supports D3D12 Mesh Shaders (`D3D12_MESH_SHADER_TIER_1+`) and emulation is not forced.
+pub fn mesh_shaders_for_device(device: &ID3D12Device) -> bool {
+    if emulate_mesh_forced() {
+        return false;
+    }
+    let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                &mut o7 as *mut _ as _,
+                std::mem::size_of_val(&o7) as u32,
+            )
+            .is_ok()
+            && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0
+    }
+}
+
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_geometry_for(vs, gs, ps, split_wave64, false)
+}
+
+/// `console_geometry` with explicit Vertex Shader emulation fallback (`emulate_vs = true` on GPUs
+/// without hardware Mesh Shaders).
+pub fn console_geometry_for(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool, emulate_vs: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
-    finish_two_pass(translation, record, ps)
+    finish_two_pass(translation, record, ps, emulate_vs)
 }
 
 /// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
