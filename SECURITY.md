@@ -6,8 +6,8 @@ Only `main` is supported. There are no releases yet, so fixes land on `main` and
 
 ## Reporting a problem
 
-Please don't open a public issue for a security problem. Send it privately to a maintainer on the
-Discord instead: <https://discord.gg/xcl>
+Please don't open a public issue for a security problem. Report it privately using GitHub Security
+Advisories instead: <https://github.com/itsF4LCON/Prodigy/security/advisories/new>
 
 Say what the problem is, how to reproduce it, and which commit you tested. A small test case helps
 more than a long write-up.
