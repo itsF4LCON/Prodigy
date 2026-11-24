@@ -1,8 +1,8 @@
-# [YOUR-PROJECT-NAME] – Xbox Series X|S → Windows Compatibility Layer
+# Prodigy – Xbox Series X|S → Windows Compatibility Layer
 
 > **Note:** This repository is an independent spin/continuation of [XCL](https://github.com/ivall/xcl).
 
-**[YOUR-PROJECT-NAME]** is a compatibility layer that runs Xbox Series X|S (GDK) games you own natively on a Windows PC—in the spirit of Wine/Proton. There is no CPU emulation: the game's x64 code executes directly on your processor, while this layer provides independently written implementations of console-exclusive system libraries (`kernelx.dll`, `XGameRuntime`, `d3d12_xs.dll`, etc.). Console GPU shaders (RDNA2 machine code) are statically recompiled into PC shaders (`HLSL` → `DXIL`).
+**Prodigy** is a compatibility layer that runs Xbox Series X|S (GDK) games you own natively on a Windows PC—in the spirit of Wine/Proton. There is no CPU emulation: the game's x64 code executes directly on your processor, while Prodigy provides independently written implementations of console-exclusive system libraries (`kernelx.dll`, `XGameRuntime`, `d3d12_xs.dll`, etc.). Console GPU shaders (RDNA2 machine code) are statically recompiled into PC shaders (`HLSL` → `DXIL`).
 
 ### Legal & Scope Disclaimer
 * **Bring Your Own Games:** This project operates strictly on unpacked game files you already own. It does not download, decrypt, or unpack console packages (`XVC` / `MSIXVC`) and contains zero functionality for circumventing DRM.
@@ -64,6 +64,59 @@ A **gamepad is strongly recommended**, as console titles expect controller navig
 
 ### Build from Source
 ```powershell
-git clone [https://github.com/itsF4LCON/Prodigy.git](https://github.com/itsF4LCON/Prodigy.git)
-cd YOUR-REPO-NAME
+git clone https://github.com/itsF4LCON/Prodigy.git
+cd Prodigy
 cargo build --release --workspace
+```
+The compiled binary will be located at `target\release\xcl.exe`.
+
+---
+
+## Usage
+
+Double-clicking `xcl.exe` from Windows Explorer launches a minimal GUI picker to select a game executable or `MicrosoftGame.config`. For advanced control and diagnostics, use the CLI:
+
+```powershell
+# Launch a game
+xcl run D:\Games\MyTitle [-- optional game args]
+
+# Inspect a game's executable imports and compatibility coverage
+xcl inspect D:\Games\MyTitle\game.exe
+
+# Disassemble raw RDNA2 shader binaries or console containers
+xcl disasm <shader.bin> [--hex]
+
+# Analyze or precompile a shader pack
+xcl shaders D:\Games\MyTitle\data\shaders.rpf --top 50
+xcl shaders D:\Games\MyTitle\data\shaders.rpf --precompile --only cs --pipelines
+
+# Extract assets from an RPF archive
+xcl rpf D:\Games\MyTitle\data\shaders.rpf --extract NAME --out output_folder
+```
+
+### Data & Logs
+Per-title runtime data is stored in `%LOCALAPPDATA%\XCL\<title>\` (overridable via `%XCL_DATA_ROOT%`):
+* `xcl.toml` – Per-game configuration (input settings, overrides)
+* `overlay\` – Redirected file writes (keeps your game folder clean)
+* `saves\`, `pls\`, `temp\` – Save data, persistent storage (`S:\`), and scratch space (`T:\`)
+* `cache\` – Compiled DXIL shader and pipeline caches (`XCL_TRANSLATED_CACHE=0` to disable)
+* `logs\report.json` – Diagnostic summary generated after every run (unimplemented stubs, shader stats, DXC version, crash info)
+
+---
+
+## Running Tests
+
+```powershell
+.\scripts\test.ps1
+```
+Runs the full workspace unit test suite, an end-to-end test title (`tests/testtitle`), and D3D12 GPU shader validation tests.
+* Use `XCL_ADAPTER=<index|name>` to target a specific GPU.
+* Set `XCL_REQUIRE_GPU=wave64,mesh` to fail instead of skipping tests when hardware features are missing.
+* Retail sample tests (`XCL_SAMPLE_RPF`, `XCL_SAMPLE_DLLS`, `XCL_SAMPLE_TTPF`, etc.) are opt-in via environment variables pointing to your own dumps (see `HANDOFF.md`).
+
+---
+
+## License
+
+This project is licensed under **GPL-2.0-only** — see [`LICENSE`](LICENSE) for details.  
+Third-party acknowledgments and reference sources are documented in [`THIRD_PARTY.md`](THIRD_PARTY.md).
