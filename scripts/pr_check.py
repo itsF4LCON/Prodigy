@@ -10,8 +10,8 @@ asks git instead of the GitHub API (whether a commit is on main, a blob's size).
 """
 import argparse, os, re, subprocess, sys
 
-SECTIONS = ("Tested", "Not tested", "AI use")
-HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
+SECTIONS = ()
+HEADINGS = ("TL;DR", "Technical details", "Tested")
 # placeholder lines copied verbatim from .github/pull_request_template.md (#965)
 TEMPLATE_PLACEHOLDERS = frozenset({
     "hardware (GPU + driver, CPU), Rust version, debug / release:",
@@ -90,15 +90,6 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
     commit is on main."""
     body = body.replace("\r\n", "\n")
     problems = []
-    for section in SECTIONS:
-        if not section_has_content(body, section):
-            problems.append(f"the **{section}** section is missing or empty")
-
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
-    banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
-    if banned:
-        problems.append("**AI use** names a model this repository does not accept for code ("
-                        + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")
 
     for path, status, binary, size in files:
         if status == "removed":

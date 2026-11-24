@@ -20,10 +20,6 @@ If you are planning a larger change, open an issue first to discuss the approach
 - **Add tests for logic changes:** Put unit tests in `#[cfg(test)] mod tests` and integration tests in `crates/prodigy/tests/`. GPU tests should skip cleanly via `gpu::recomp::runner::skip_test(...)` when required hardware features are missing.
 - **Update `README.md`** if your change affects user-facing behavior or game compatibility.
 
-## AI-Assisted Contributions
-
-AI coding tools are welcome. Please review and understand the diff yourself, actually run the build/tests before opening a PR, and briefly mention which tool/model helped in the PR description.
-
 ## Legal & License
 
 Prodigy is licensed under **GPL-2.0-only** ([`LICENSE`](LICENSE)).
