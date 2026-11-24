@@ -72,6 +72,9 @@ pub struct Config {
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
+    /// Optional frame-clock FPS cap (0 = title's own interval; e.g. 30 for smooth 30 FPS
+    /// pacing on older GPUs). `PRODIGY_MAX_FPS` overrides.
+    pub max_fps: u32,
 }
 
 impl Config {
@@ -187,6 +190,7 @@ impl Default for Config {
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
+            max_fps: 0,
         }
     }
 }

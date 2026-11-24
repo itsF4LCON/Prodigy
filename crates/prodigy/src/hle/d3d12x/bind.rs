@@ -518,11 +518,59 @@ unsafe fn translated_dispatch_mesh(
     };
     list.ResourceBarrier(&[barrier]);
 
-    // Pass 2: rasterise records via hardware Mesh Shader or emulated Vertex Shader.
+    // Pass 2: rasterise records via hardware Mesh Shader or compacted emulated Vertex Shader.
     let mesh_rs_ptr = tp.mesh_rs as *mut c_void;
     let mesh_rs = ID3D12RootSignature::from_raw_borrowed(&mesh_rs_ptr).ok_or("mesh root signature")?;
     let mesh_pso_ptr = real_pso as *mut c_void;
     let mesh_pso = ID3D12PipelineState::from_raw_borrowed(&mesh_pso_ptr).ok_or("mesh pipeline")?;
+    if tp.emulated_vs && tp.compact != 0 && tp.draw_cmd_sig != 0 {
+        let compact_bytes = 16usize.saturating_add(groups as usize * tp.record.max_primitives.max(1) as usize * 4);
+        let compact_at = alloc_uma(compact_bytes)?;
+        // Seed D3D12_DRAW_ARGUMENTS { VertexCountPerInstance=0, InstanceCount=1, StartVertex=0, StartInstance=0 }.
+        let draw_init: [u32; 4] = [0, 1, 0, 0];
+        std::ptr::copy_nonoverlapping(draw_init.as_ptr() as *const u8, compact_at as *mut u8, 16);
+        let compact_va = va(compact_at);
+
+        // Compaction pass: filter culled/invalid triangles into `compact` (`u2`) and fill DrawArguments.
+        let comp_pso_ptr = tp.compact as *mut c_void;
+        let comp_pso = ID3D12PipelineState::from_raw_borrowed(&comp_pso_ptr).ok_or("compact pipeline")?;
+        list.SetPipelineState(comp_pso);
+        list.SetComputeRootUnorderedAccessView(2, compact_va);
+        list.Dispatch(groups, 1, 1);
+        let comp_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+        };
+        list.ResourceBarrier(&[comp_barrier]);
+
+        // Pass 2: ExecuteIndirect with compacted VS + PS reading only surviving triangles.
+        list.SetGraphicsRootSignature(mesh_rs);
+        list.SetGraphicsRootUnorderedAccessView(0, views[0]);
+        list.SetGraphicsRootUnorderedAccessView(1, views[1]);
+        list.SetGraphicsRootUnorderedAccessView(2, compact_va);
+        list.SetGraphicsRootUnorderedAccessView(3, views[3]);
+        list.SetGraphicsRootUnorderedAccessView(4, views[4]);
+        list.SetGraphicsRootUnorderedAccessView(5, views[5]);
+        list.SetPipelineState(mesh_pso);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if let Some((arg_res_ptr, arg_off)) = super::real::uma_window_buffer(compact_at, 16) {
+            let cmd_sig_ptr = tp.draw_cmd_sig as *mut c_void;
+            let arg_res_raw = arg_res_ptr as *mut c_void;
+            if let (Some(cmd_sig), Some(arg_res)) = (
+                ID3D12CommandSignature::from_raw_borrowed(&cmd_sig_ptr),
+                ID3D12Resource::from_raw_borrowed(&arg_res_raw),
+            ) {
+                list.ExecuteIndirect(cmd_sig, 1, arg_res, arg_off, None, 0);
+                return Ok(());
+            }
+        }
+        // Fallback if UMA resource lookup is unavailable
+        list.DrawInstanced(emulated_mesh_vertex_count(groups, tp.record.max_primitives), 1, 0, 0);
+        return Ok(());
+    }
     list.SetGraphicsRootSignature(mesh_rs);
     for (k, &v) in views.iter().enumerate() {
         list.SetGraphicsRootUnorderedAccessView(k as u32, v);
