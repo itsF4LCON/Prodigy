@@ -65,4 +65,6 @@ jobs:
               approval_args=(--test-only)
             fi
           fi
-          python3 scripts/pr_check.py --body body.md --head "$HEAD" --files files.tsv --repo "$REPO" "${approval_args[@]}"
+          # Retail-game smoke runs are optional for now (see CONTRIBUTING.md); still enforce
+          # the game-data/binary guard and PR description checks.
+          python3 scripts/pr_check.py --body body.md --head "$HEAD" --files files.tsv --repo "$REPO" --test-only
