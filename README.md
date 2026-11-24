@@ -37,6 +37,7 @@ cargo build --release --workspace
 Double-click `target\release\prodigy.exe` for the GUI picker, or use the CLI:
 
 ```powershell
+prodigy check [--json]
 prodigy run D:\Games\MyTitle [-- game args]
 prodigy inspect D:\Games\MyTitle\game.exe
 prodigy disasm <shader.bin>

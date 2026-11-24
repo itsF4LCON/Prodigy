@@ -181,6 +181,29 @@ pub fn print(checks: &[Check]) {
     }
 }
 
+/// Exit code for `prodigy check`: 0 if no errors, 1 if any `Level::Error` check failed.
+pub fn exit_code(checks: &[Check]) -> i32 {
+    if checks.iter().any(|c| c.level == Level::Error) { 1 } else { 0 }
+}
+
+/// Standalone GPU & environment readiness check (`prodigy check [--json]`).
+pub fn cli(json: bool) -> i32 {
+    let list = run("auto");
+    if json {
+        match serde_json::to_string_pretty(&list) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("prodigy check: {e}");
+                return 1;
+            }
+        }
+    } else {
+        println!("Prodigy {} – system & GPU check", env!("CARGO_PKG_VERSION"));
+        print(&list);
+    }
+    exit_code(&list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +277,12 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"level\":\"error\""), "{json}");
         assert_eq!(serde_json::from_str::<Vec<Check>>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn exit_code_reflects_errors() {
+        assert_eq!(exit_code(&checks(&found(gpu()))), 0);
+        assert_eq!(exit_code(&checks(&found(Gpu { warp: true, ..gpu() }))), 0);
+        assert_eq!(exit_code(&checks(&Found { dxc: Err("missing".into()), ..found(gpu()) })), 1);
     }
 }
