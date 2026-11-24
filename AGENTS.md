@@ -101,10 +101,4 @@ test counts by hand.
 
 ## Pull request description
 
-Write it to the outline in `CONTRIBUTING.md`: what and why, **What is in it**, **Tested** (hardware,
-commands, counts), **Not tested**, **AI use**. Keep it short and factual: no summaries of the diff line
-by line, no claims that were not measured, no filler. Link the issue (`Fixes #N`).
-
-**Always name your model** (and the tool you run in) in **AI use**, in commit trailers and in test
-reports, e.g. `Claude Code, Claude Opus 5.5`. Use the exact model name you were given; if you do not
-know it, write that you do not know rather than guessing.
+Use the outline in `.github/pull_request_template.md`: **TL;DR** (short summary), **Technical details** (how it works and key files changed), and **Tested** (hardware, commands, counts). Keep it concise and factual; no claims that were not measured. Link any related issue (`Fixes #N`).
