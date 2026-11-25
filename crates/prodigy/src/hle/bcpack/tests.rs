@@ -62,7 +62,8 @@ fn model_matches_the_patent_excerpt() {
     let base = [0u32, 7575, 14276, 25440, 41008, 56352, 64256, 65344, 65408];
     let freq = [7575u32, 6701, 5582, 3892, 1918, 494, 34, 1, 1];
     assert_eq!(FREQ[7 * 16 + 11], freq);
-    assert_eq!(super::victory::Tables::builtin().start[7 * 16 + 11], base);
+    assert_eq!(&super::victory::Tables::builtin().start[7 * 16 + 11][..9], &base);
+    assert_eq!(super::victory::Tables::builtin().start[7 * 16 + 11][9], 65536);
     for (m, f) in FREQ.iter().enumerate().take(MODELS) {
         let total: u32 = (0..9).map(|k| f[k] << k.saturating_sub(1)).sum();
         assert_eq!(total, 65536, "model {m}");
@@ -111,5 +112,19 @@ fn bc7_dictionary_indices_line_up() {
         let hi = 1i16 << (ix.bits[0] - 1);
         let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && (0..hi).contains(&ix.ix[0][0]);
         assert!(ok, "entry {k}: {:?}", ix.ix);
+    }
+}
+
+/// The 256-slot window table finds the exact same bucket as a linear scan of `start`,
+/// for every slot of every built-in model.
+#[test]
+fn bucket_lookup_matches_linear_scan() {
+    let t = super::victory::Tables::builtin();
+    for model in 0..super::tables::MODELS as u8 {
+        let start = &t.start[usize::from(model)];
+        for slot in 0..(1u32 << 16) {
+            let scan = start[1..super::tables::BUCKETS].iter().filter(|&&s| s <= slot).count();
+            assert_eq!(super::victory::bucket_of(t, model, slot), scan, "model {model} slot {slot}");
+        }
     }
 }
