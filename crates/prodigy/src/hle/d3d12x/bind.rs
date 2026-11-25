@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -36,7 +36,13 @@ struct State {
     arena: crate::gpu::uma::Arena,
 }
 
-static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+const STATE_SHARDS: usize = 32;
+static STATES: [Mutex<Option<HashMap<usize, State>>>; STATE_SHARDS] = [const { Mutex::new(None) }; STATE_SHARDS];
+
+#[inline]
+fn state_shard(list: usize) -> &'static Mutex<Option<HashMap<usize, State>>> {
+    &STATES[((list >> 4) ^ (list >> 12)) & (STATE_SHARDS - 1)]
+}
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -66,7 +72,8 @@ fn count(k: usize) {
 }
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+    let key = list as usize;
+    f(state_shard(key).lock().unwrap().get_or_insert_with(HashMap::new).entry(key).or_default())
 }
 
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
@@ -123,7 +130,8 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+    let key = list as usize;
+    if let Some(s) = state_shard(key).lock().unwrap().as_mut().and_then(|m| m.remove(&key)) {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
 }
@@ -148,7 +156,8 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
-    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    let key = list as usize;
+    state_shard(key).lock().unwrap().as_mut().and_then(|m| m.remove(&key));
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -174,8 +183,10 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
+    let size = layout.as_ref().map_or(0, |l| l.size as usize);
     with(this, |s| {
-        s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        s.args_gfx.clear();
+        s.args_gfx.resize(size, 0);
         s.layout_gfx = layout;
         s.rs_gfx = rs as usize;
     });
@@ -194,8 +205,10 @@ pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_voi
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
 pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
     if !data.is_null() {
-        let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
-        put_in(this, true, i, offset, &bytes);
+        if let Some(len) = (n as usize).checked_mul(4) {
+            let bytes = std::slice::from_raw_parts(data as *const u8, len);
+            put_in(this, true, i, offset, bytes);
+        }
     }
 }
 
@@ -223,10 +236,21 @@ fn note_address(va: u64) {
 }
 
 /// command signatures that change root arguments (they need the title's root signature)
-static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static ROOT_SIGNATURES: RwLock<Option<std::collections::HashSet<usize>>> = RwLock::new(None);
+static ROOT_SIGNATURES_LEN: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn note_root_changing_signature(sig: usize) {
-    ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
+    if ROOT_SIGNATURES.write().unwrap().get_or_insert_with(Default::default).insert(sig) {
+        ROOT_SIGNATURES_LEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[inline]
+fn is_root_changing_signature(sig: usize) -> bool {
+    if ROOT_SIGNATURES_LEN.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    ROOT_SIGNATURES.read().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
 
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
@@ -259,7 +283,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
-    if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+    if is_root_changing_signature(sig) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -860,8 +884,10 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
+    let size = layout.as_ref().map_or(0, |l| l.size as usize);
     with(this, |s| {
-        s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        s.args.clear();
+        s.args.resize(size, 0);
         s.layout = layout;
     });
 }
@@ -879,8 +905,10 @@ pub(super) unsafe extern "system" fn set_compute_root_constant(this: *mut c_void
 /// #39 SetComputeRoot32BitConstants (PC #35)
 pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
     if !data.is_null() {
-        let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
-        put(this, i, offset, &bytes);
+        if let Some(len) = (n as usize).checked_mul(4) {
+            let bytes = std::slice::from_raw_parts(data as *const u8, len);
+            put(this, i, offset, bytes);
+        }
     }
 }
 
@@ -1100,11 +1128,12 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
 
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
-    STATES
+    let key = list as usize;
+    state_shard(key)
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|m| m.get(&(list as usize)))
+        .and_then(|m| m.get(&key))
         .map_or(0, |s| s.pso)
 }
 
@@ -1474,5 +1503,41 @@ mod tests {
         assert_eq!(emulated_mesh_vertex_count(2, 0), 6);
         assert_eq!(emulated_mesh_vertex_count(2, 128), 768);
         assert_eq!(emulated_mesh_vertex_count(u32::MAX, 128), u32::MAX);
+    }
+
+    #[test]
+    fn sharded_root_constants_copy_and_reuse_capacity() {
+        let list_a = 0x7E57_A010usize as *mut c_void;
+        let list_b = 0x7E57_A020usize as *mut c_void;
+        let layout = Arc::new(Layout { params: vec![Param::Constants { at: 0, count: 4 }], size: 16, ..Default::default() });
+        with(list_a, |s| {
+            s.layout_gfx = Some(Arc::clone(&layout));
+            s.args_gfx.resize(16, 0);
+            s.layout = Some(Arc::clone(&layout));
+            s.args.resize(16, 0);
+        });
+        with(list_b, |s| {
+            s.layout_gfx = Some(Arc::clone(&layout));
+            s.args_gfx.resize(16, 0);
+        });
+        let vals_a = [0x1122_3344u32, 0x5566_7788u32];
+        let vals_b = [0xDEAD_BEEFu32, 0xCAFE_BABEu32];
+        unsafe {
+            set_graphics_root_constants(list_a, 0, 2, vals_a.as_ptr(), 1);
+            set_compute_root_constants(list_a, 0, 2, vals_a.as_ptr(), 0);
+            set_graphics_root_constants(list_b, 0, 2, vals_b.as_ptr(), 2);
+        }
+        with(list_a, |s| {
+            assert_eq!(&s.args_gfx[4..8], &0x1122_3344u32.to_le_bytes());
+            assert_eq!(&s.args_gfx[8..12], &0x5566_7788u32.to_le_bytes());
+            assert_eq!(&s.args[0..4], &0x1122_3344u32.to_le_bytes());
+            assert_eq!(&s.args[4..8], &0x5566_7788u32.to_le_bytes());
+        });
+        with(list_b, |s| {
+            assert_eq!(&s.args_gfx[8..12], &0xDEAD_BEEFu32.to_le_bytes());
+            assert_eq!(&s.args_gfx[12..16], &0xCAFE_BABEu32.to_le_bytes());
+        });
+        remove_state_for_test(list_a);
+        remove_state_for_test(list_b);
     }
 }
