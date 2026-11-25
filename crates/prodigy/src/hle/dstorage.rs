@@ -843,29 +843,97 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+/// Log and count a request as it begins execution.
+fn note_request(r: &Request) {
+    let n = r.destination_size as usize;
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    if k < 16 || k.is_power_of_two() {
+        crate::xlog_info!(
+            "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
+            r.options,
+            if r.memory_source() { "memory" } else { "file" },
+            if r.zlib() { ", zlib" } else { "" },
+            r.destination,
+            if r.dest_physical_pages() { " (physical pages)" } else { "" },
+            r.destination_page_offset,
+            r.source_size,
+            r.intermediate_size
+        );
+    }
+}
+
+/// Decompress `src` according to `r`'s options (zlib, then BCPack) into a payload buffer of at
+/// least `r.destination_size` bytes. Pure CPU work safe to run on a worker thread.
+fn decompress_payload(r: &Request, src: Vec<u8>) -> Result<Vec<u8>, HRESULT> {
+    let n = r.destination_size as usize;
+    let bc = r.bcpack();
+    if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
+        return Err(E_DECOMPRESSION);
+    }
+
+    // the stages in the console's order: zlib, then BCPack
+    let stage1: Vec<u8> = if r.zlib() {
+        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        // zlib yields `intermediate_size` bytes; when the title names none, the destination's
+        // size, or before BCPack a stream of any size up to it. That last case is Prodigy's
+        // leniency, as is a BCPack stream no smaller than its blocks: the GDK documents
+        // `IntermediateSize` as the size of the stream BCPack reads, and what the console does
+        // with a request that leaves it 0 was not tested.
+        if d.len() != stage1_len && (bc == 0 || r.intermediate_size != 0) {
+            return Err(E_ZLIB_DATA);
+        }
+        if bc == 0 && d.len() < n {
+            d.resize(n, 0);
+        }
+        d
+    } else {
+        src
+    };
+    if bc != 0 { bcpack_unpack(r, &stage1, n) } else { Ok(stage1) }
+}
+
+/// Read and decompress a file-backed request on a worker thread.
+fn read_and_decompress_file(r: &Request, file: &FileInner) -> Result<Vec<u8>, HRESULT> {
+    let f = file.handle().ok_or(E_FILE_HANDLE)?;
+    let mut b = vec![0u8; r.source_size as usize];
+    read_exact_at(&f, r.offset, &mut b)?;
+    decompress_payload(r, b)
+}
+
+/// Write `payload[..r.destination_size]` into the request's virtual or physical-page destination.
+unsafe fn write_destination(r: &Request, dest_pages: Option<&[usize]>, payload: &[u8]) -> Result<(), HRESULT> {
+    let n = r.destination_size as usize;
+    if r.dest_physical_pages() {
+        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
+        // read again now. A retail title keeps its page arrays in its own tables and fills an
+        // entry after EnqueueRequest – its streaming requests were refused by the thousand
+        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
+        // (titles also pass arrays on the stack).
+        let late: Vec<usize>;
+        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
+            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
+            &late[..]
+        } else {
+            pages
+        };
+        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            return Err(E_ACCESS_VIOLATION);
+        }
+    } else if n > 0 {
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+    }
+    Ok(())
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
-    {
-        // the first requests: where a title's data goes and how it is packed
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let k = N.fetch_add(1, Ordering::Relaxed);
-        REQUESTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        if k < 16 || k.is_power_of_two() {
-            crate::xlog_info!(
-                "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
-                r.options,
-                if r.memory_source() { "memory" } else { "file" },
-                if r.zlib() { ", zlib" } else { "" },
-                r.destination,
-                if r.dest_physical_pages() { " (physical pages)" } else { "" },
-                r.destination_page_offset,
-                r.source_size,
-                r.intermediate_size
-            );
-        }
-    }
+    note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
@@ -892,53 +960,67 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    let bc = r.bcpack();
-    if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
-        return Err(E_DECOMPRESSION);
-    }
+    let payload = decompress_payload(r, src)?;
+    write_destination(r, dest_pages, &payload)
+}
 
-    // the stages in the console's order: zlib, then BCPack
-    let stage1: Vec<u8> = if r.zlib() {
-        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
-        // zlib yields `intermediate_size` bytes; when the title names none, the destination's
-        // size, or before BCPack a stream of any size up to it. That last case is Prodigy's
-        // leniency, as is a BCPack stream no smaller than its blocks: the GDK documents
-        // `IntermediateSize` as the size of the stream BCPack reads, and what the console does
-        // with a request that leaves it 0 was not tested.
-        if d.len() != stage1_len && (bc == 0 || r.intermediate_size != 0) {
-            return Err(E_ZLIB_DATA);
-        }
-        if bc == 0 && d.len() < n {
-            d.resize(n, 0);
-        }
-        d
-    } else {
-        src
-    };
-    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+// ---------------------------------------------------------------------------------------
+// parallel decompression pool
+// ---------------------------------------------------------------------------------------
 
-    if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
-        } else {
-            pages
-        };
-        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
-            return Err(E_ACCESS_VIOLATION);
+fn parallel_decompress_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PRODIGY_DSTORAGE_PARALLEL_DECOMPRESS").map_or(true, |v| v.trim() != "0"))
+}
+
+fn parallel_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PRODIGY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 16)
+    })
+}
+
+fn parallel_memory_budget() -> usize {
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        let mib = std::env::var("PRODIGY_DSTORAGE_MEMORY_BUDGET_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(4, 512);
+        mib << 20
+    })
+}
+
+struct DecompressJob {
+    req: Request,
+    file: Arc<FileInner>,
+    reply: mpsc::SyncSender<Result<Vec<u8>, HRESULT>>,
+}
+
+fn decompress_pool() -> &'static Mutex<mpsc::Sender<DecompressJob>> {
+    static POOL: OnceLock<Mutex<mpsc::Sender<DecompressJob>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<DecompressJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = parallel_workers();
+        for k in 0..n {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new().name(format!("prodigy-ds-dec-{k}")).spawn(move || loop {
+                let job = match rx.lock().unwrap().recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
+                };
+                let res = read_and_decompress_file(&job.req, &job.file);
+                let _ = job.reply.send(res);
+            });
         }
-    } else if n > 0 {
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
-    }
-    Ok(())
+        Mutex::new(tx)
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1076,6 +1158,77 @@ impl QueueInner {
         drop(sent);
     }
 
+    /// Execute a contiguous run of file-backed compressed requests in parallel on the shared
+    /// decompression pool while retiring destination writes, errors, and status in strict `seq`
+    /// order under a bounded staging memory budget.
+    fn run_parallel_file_run(
+        &self,
+        run: Vec<(u64, Request, Arc<FileInner>, Option<Vec<usize>>)>,
+        since_status: &mut HRESULT,
+    ) {
+        let max_inflight = (parallel_workers() * 2).max(2);
+        let budget = parallel_memory_budget();
+        let mut iter = run.into_iter().peekable();
+        let mut inflight: std::collections::VecDeque<(
+            u64,
+            Request,
+            Arc<FileInner>,
+            Option<Vec<usize>>,
+            usize,
+            Option<mpsc::Receiver<Result<Vec<u8>, HRESULT>>>,
+            Option<HRESULT>,
+        )> = std::collections::VecDeque::new();
+        let mut staged_bytes: usize = 0;
+
+        while iter.peek().is_some() || !inflight.is_empty() {
+            while let Some(&(seq, req, _, _)) = iter.peek() {
+                if self.closed.load(Ordering::Acquire) {
+                    iter.by_ref().for_each(drop);
+                    break;
+                }
+                let need = req.destination_size as usize;
+                if !inflight.is_empty() && (inflight.len() >= max_inflight || staged_bytes.saturating_add(need) > budget) {
+                    break;
+                }
+                let (_, req, file, dest_pages) = iter.next().unwrap();
+                if self.is_cancelled(seq, req.tag) {
+                    continue;
+                }
+                note_request(&req);
+                if !req.dest_physical_pages() && !writable(req.destination as usize, need) {
+                    inflight.push_back((seq, req, file, dest_pages, 0, None, Some(E_ACCESS_VIOLATION)));
+                    continue;
+                }
+                let (tx, rx) = mpsc::sync_channel(1);
+                let job = DecompressJob { req, file: Arc::clone(&file), reply: tx };
+                let _ = decompress_pool().lock().unwrap().send(job);
+                staged_bytes = staged_bytes.saturating_add(need);
+                inflight.push_back((seq, req, file, dest_pages, need, Some(rx), None));
+            }
+
+            let Some((seq, req, file, dest_pages, bytes, rx, immediate_err)) = inflight.pop_front() else {
+                break;
+            };
+            let res = match (immediate_err, rx) {
+                (Some(hr), _) => Err(hr),
+                (None, Some(rx)) => rx.recv().unwrap_or(Err(E_ABORT)),
+                (None, None) => Err(E_ABORT),
+            };
+            staged_bytes = staged_bytes.saturating_sub(bytes);
+
+            if self.closed.load(Ordering::Acquire) || self.is_cancelled(seq, req.tag) {
+                continue;
+            }
+            let outcome = res.and_then(|payload| unsafe { write_destination(&req, dest_pages.as_deref(), &payload) });
+            if let Err(hr) = outcome {
+                self.fail(hr, req, Some(file.as_ref()));
+                if *since_status >= 0 {
+                    *since_status = hr;
+                }
+            }
+        }
+    }
+
     fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
         struct ActiveGuard<'a>(&'a QueueInner);
         impl Drop for ActiveGuard<'_> {
@@ -1087,8 +1240,10 @@ impl QueueInner {
         let _active = ActiveGuard(self);
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
+        let use_parallel = parallel_decompress_enabled() && parallel_workers() > 1;
         for batch in rx {
-            for e in batch {
+            let mut it = batch.into_iter().peekable();
+            while let Some(e) = it.next() {
                 if self.closed.load(Ordering::Acquire) {
                     if let Entry::Status(s, i) = e {
                         if let Some(slot) = s.slots.get(i as usize) {
@@ -1099,6 +1254,30 @@ impl QueueInner {
                 }
                 match e {
                     Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                        let eligible = use_parallel
+                            && !req.memory_source()
+                            && (req.zlib() || req.bcpack() != 0)
+                            && file.is_some();
+                        let next_eligible = eligible
+                            && matches!(
+                                it.peek(),
+                                Some(Entry::Request { req: nr, file: Some(_), .. })
+                                    if !nr.memory_source() && (nr.zlib() || nr.bcpack() != 0)
+                            );
+                        if next_eligible {
+                            let mut run = vec![(seq, req, file.unwrap(), dest_pages)];
+                            while matches!(
+                                it.peek(),
+                                Some(Entry::Request { req: nr, file: Some(_), .. })
+                                    if !nr.memory_source() && (nr.zlib() || nr.bcpack() != 0)
+                            ) {
+                                if let Some(Entry::Request { seq, req, file, dest_pages, .. }) = it.next() {
+                                    run.push((seq, req, file.unwrap(), dest_pages));
+                                }
+                            }
+                            self.run_parallel_file_run(run, &mut since_status);
+                            continue;
+                        }
                         if self.is_cancelled(seq, req.tag) {
                             // Cancelled requests are skipped without affecting status or error record.
                             continue;
@@ -2482,5 +2661,105 @@ mod tests {
             queue_release(q);
             status_release(s);
         }
+    }
+
+    #[test]
+    fn parallel_file_zlib_batch_preserves_order_and_errors() {
+        let dir = std::env::temp_dir().join(format!("prodigy-ds-par-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("chunks.bin");
+
+        // Build 12 distinct zlib chunks + 1 corrupt chunk into a single file.
+        let mut blob = Vec::new();
+        let mut meta: Vec<(u64, u32, Vec<u8>)> = Vec::new();
+        for i in 0u8..12 {
+            let plain: Vec<u8> = (0..(4096 + (i as usize) * 513)).map(|k| i.wrapping_mul(31).wrapping_add(k as u8)).collect();
+            let comp = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            let off = blob.len() as u64;
+            let clen = comp.len() as u32;
+            blob.extend_from_slice(&comp);
+            meta.push((off, clen, plain));
+        }
+        let corrupt_off = blob.len() as u64;
+        let corrupt_bytes = [0xFFu8; 32];
+        blob.extend_from_slice(&corrupt_bytes);
+        std::fs::write(&path, &blob).unwrap();
+
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let open_file: unsafe extern "system" fn(*mut c_void, *const u16, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(4));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&0u32.to_le_bytes()); // file queue
+            desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut file = std::ptr::null_mut();
+            let wpath: Vec<u16> = path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+            assert_eq!(open_file(f, wpath.as_ptr(), &IID_FILE, &mut file), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 3, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // Batch 1: 12 parallel file-backed zlib reads to distinct destinations.
+            let mut dsts: Vec<Vec<u8>> = meta.iter().map(|m| vec![0u8; m.2.len()]).collect();
+            for ((off, clen, plain), dst) in meta.iter().zip(dsts.iter_mut()) {
+                let r = request(ZLIB_BIT, dst.as_mut_ptr() as u64, plain.len() as u32, file as u64, *off, *clen);
+                enqueue(q, r.as_ptr());
+            }
+            status(q, s, 0);
+
+            // Batch 2: two parallel requests writing to the SAME destination — second must win.
+            let mut shared_dst = vec![0u8; meta[0].2.len().max(meta[1].2.len())];
+            let r0 = request(ZLIB_BIT, shared_dst.as_mut_ptr() as u64, meta[0].2.len() as u32, file as u64, meta[0].0, meta[0].1);
+            let r1 = request(ZLIB_BIT, shared_dst.as_mut_ptr() as u64, meta[1].2.len() as u32, file as u64, meta[1].0, meta[1].1);
+            enqueue(q, r0.as_ptr());
+            enqueue(q, r1.as_ptr());
+            status(q, s, 1);
+
+            // Batch 3: corrupt zlib followed by a valid request in the same parallel run.
+            let mut bad_dst = vec![0xAAu8; 256];
+            let mut ok_dst = vec![0u8; meta[2].2.len()];
+            let r_bad = request(ZLIB_BIT, bad_dst.as_mut_ptr() as u64, bad_dst.len() as u32, file as u64, corrupt_off, corrupt_bytes.len() as u32);
+            let r_ok = request(ZLIB_BIT, ok_dst.as_mut_ptr() as u64, meta[2].2.len() as u32, file as u64, meta[2].0, meta[2].1);
+            enqueue(q, r_bad.as_ptr());
+            enqueue(q, r_ok.as_ptr());
+            status(q, s, 2);
+
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 2) && t.elapsed().as_secs() < 10 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s, 2), "parallel batches timed out");
+            assert_eq!(hresult(s, 0), S_OK);
+            for (i, (m, dst)) in meta.iter().zip(&dsts).enumerate() {
+                assert_eq!(*dst, m.2, "chunk {i} mismatch");
+            }
+            assert_eq!(hresult(s, 1), S_OK);
+            assert_eq!(&shared_dst[..meta[1].2.len()], &meta[1].2[..], "later request must overwrite earlier in strict queue order");
+            assert_eq!(hresult(s, 2), E_ZLIB_DATA);
+            assert!(bad_dst.iter().all(|&b| b == 0xAA), "failed request must not touch destination");
+            assert_eq!(ok_dst, meta[2].2, "valid request after failure still completes");
+
+            let fv = *(file as *const *const usize);
+            let file_release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*fv.add(2));
+            file_release(file);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
