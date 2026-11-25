@@ -6,7 +6,136 @@
 //! offset is linear over GF(2): `offset(x, y, z) = ox[x] ^ oy[y] ^ oz[z]`, small tables per
 //! layout. Blocks (256 B / 4 KB / 64 KB) are laid out row-major; `Chain` lays out the mips.
 
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
 use super::tiling_tables::{NIBBLE01, NIBBLE2, NIBBLE3, NIBBLE4, PATTERNS, PATTERNS_3D};
+
+/// Persistent CPU worker pool for parallel texture detiling (avoids per-submit OS thread
+/// creation and lets single large textures fan out by row bands across CPU cores).
+pub(crate) mod pool {
+    use super::*;
+
+    thread_local! {
+        static IN_WORKER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    struct Pool {
+        workers: usize,
+        queue: Mutex<VecDeque<Job>>,
+        cv: Condvar,
+    }
+
+    fn get() -> &'static Pool {
+        static P: OnceLock<Pool> = OnceLock::new();
+        P.get_or_init(|| {
+            let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+            Pool { workers, queue: Mutex::new(VecDeque::new()), cv: Condvar::new() }
+        })
+    }
+
+    fn ensure_started(pool: &'static Pool) {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            for k in 0..pool.workers {
+                let _ = std::thread::Builder::new().name(format!("prodigy-detile-{k}")).spawn(move || {
+                    IN_WORKER.with(|c| c.set(true));
+                    loop {
+                        let job = {
+                            let mut q = pool.queue.lock().unwrap();
+                            loop {
+                                if let Some(j) = q.pop_front() {
+                                    break j;
+                                }
+                                q = pool.cv.wait(q).unwrap();
+                            }
+                        };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                });
+            }
+        });
+    }
+
+    /// Number of persistent CPU detile workers.
+    pub(crate) fn worker_count() -> usize {
+        get().workers
+    }
+
+    /// Run `f(task_index)` for `0..tasks` across up to `max_threads` persistent workers,
+    /// blocking until all tasks finish. If already running on a pool worker or `tasks <= 1`,
+    /// runs inline to prevent nested-wait deadlocks.
+    pub(crate) fn for_each<F: Fn(usize) + Sync>(tasks: usize, max_threads: usize, f: &F) {
+        if tasks == 0 {
+            return;
+        }
+        let pool = get();
+        let threads = max_threads.min(pool.workers).min(tasks);
+        if threads <= 1 || IN_WORKER.with(|c| c.get()) {
+            for i in 0..tasks {
+                f(i);
+            }
+            return;
+        }
+        ensure_started(pool);
+
+        let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new((Mutex::new(threads - 1), Condvar::new()));
+
+        struct WaitGuard(Arc<(Mutex<usize>, Condvar)>);
+        impl Drop for WaitGuard {
+            fn drop(&mut self) {
+                let mut rem = self.0 .0.lock().unwrap();
+                while *rem > 0 {
+                    rem = self.0 .1.wait(rem).unwrap();
+                }
+            }
+        }
+        let _guard = WaitGuard(Arc::clone(&done));
+
+        // SAFETY: `_guard` blocks until all spawned closures complete before `for_each` returns
+        // (even on unwind), so `f` outlives every worker invocation.
+        let f_ptr = f as *const F as usize;
+        fn call<F: Fn(usize) + Sync>(ptr: usize, idx: usize) {
+            unsafe { (&*(ptr as *const F))(idx) };
+        }
+        let run_fn: fn(usize, usize) = call::<F>;
+        fn dispatch_one(next: &AtomicUsize, tasks: usize, f_ptr: usize, run: fn(usize, usize)) {
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= tasks {
+                    break;
+                }
+                run(f_ptr, k);
+            }
+        }
+
+        {
+            let mut q = pool.queue.lock().unwrap();
+            for _ in 0..(threads - 1) {
+                let next = Arc::clone(&next);
+                let done = Arc::clone(&done);
+                q.push_back(Box::new(move || {
+                    let _res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch_one(&next, tasks, f_ptr, run_fn);
+                    }));
+                    let mut rem = done.0.lock().unwrap();
+                    *rem -= 1;
+                    if *rem == 0 {
+                        done.1.notify_all();
+                    }
+                }));
+            }
+        }
+        pool.cv.notify_all();
+        // Calling thread participates as worker #0.
+        dispatch_one(&next, tasks, f_ptr, run_fn);
+    }
+}
 
 /// The part of GB_ADDR_CONFIG the XOR modes depend on (number of pipes and packers, log2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,27 +546,76 @@ impl Chain {
         }
         // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
         // depends on y (and the slice) once per row – per element only two lookups and an XOR.
-        // Element by element it was most of a retail game's render thread while it streamed
-        // textures the CPU writes.
+        // Pre-multiply `block_x * block_bytes` and fold `base_xor` into `yz` so the inner loop
+        // does only additions and a single XOR, specialized on element size `E`.
         let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
         let pitch_blocks = l.pitch.div_ceil(t.block_w);
         let columns: Vec<(usize, u32)> = (0..l.width)
             .map(|x| {
                 let x = x + l.origin.0;
-                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
+                ((x / t.block_w) * t.block_bytes, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
             })
             .collect();
-        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
-        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
-            let y = y + l.origin.1;
-            let row_blocks = (y / t.block_h) * pitch_blocks;
-            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
-            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
-                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
-                if let Some(s) = src.get(o..o + e) {
-                    dst.copy_from_slice(s);
+        let z_xor = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d) ^ (t.base_xor as u32);
+        let row_bytes = l.width * e;
+        let detile_band = |y_start: usize, band: &mut [u8]| {
+            macro_rules! run_const_e {
+                ($E:expr) => {
+                    for (dy, row) in band.chunks_exact_mut(row_bytes).enumerate() {
+                        let y = y_start + dy + l.origin.1;
+                        let row_base = l.offset + ((y / t.block_h) * pitch_blocks) * t.block_bytes;
+                        let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z_xor;
+                        for (&(col_base, x), dst) in columns.iter().zip(row.chunks_exact_mut($E)) {
+                            let o = row_base + col_base + ((x ^ yz) as usize);
+                            if let Some(s) = src.get(o..o + $E) {
+                                dst.copy_from_slice(s);
+                            }
+                        }
+                    }
+                };
+            }
+            match e {
+                1 => run_const_e!(1),
+                2 => run_const_e!(2),
+                4 => run_const_e!(4),
+                8 => run_const_e!(8),
+                16 => run_const_e!(16),
+                _ => {
+                    for (dy, row) in band.chunks_exact_mut(row_bytes).enumerate() {
+                        let y = y_start + dy + l.origin.1;
+                        let row_base = l.offset + ((y / t.block_h) * pitch_blocks) * t.block_bytes;
+                        let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z_xor;
+                        for (&(col_base, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
+                            let o = row_base + col_base + ((x ^ yz) as usize);
+                            if let Some(s) = src.get(o..o + e) {
+                                dst.copy_from_slice(s);
+                            }
+                        }
+                    }
                 }
             }
+        };
+
+        // Fan out large mip levels across the persistent CPU pool in disjoint row bands.
+        const PARALLEL_LEVEL_BYTES: usize = 512 << 10;
+        let workers = pool::worker_count();
+        if out.len() >= PARALLEL_LEVEL_BYTES && l.height >= 16 && workers > 1 {
+            let bands = (workers * 2).min(l.height / 4).max(1);
+            let rows_per_band = l.height.div_ceil(bands);
+            let band_bytes = rows_per_band * row_bytes;
+            let total_bytes = out.len();
+            let out_ptr = out.as_mut_ptr() as usize;
+            let n_bands = total_bytes.div_ceil(band_bytes);
+            pool::for_each(n_bands, workers, &|b| {
+                let byte_start = b * band_bytes;
+                let byte_len = (total_bytes - byte_start).min(band_bytes);
+                let y_start = b * rows_per_band;
+                // SAFETY: each band `b` owns a strictly disjoint slice `[byte_start..byte_start + byte_len)`.
+                let band = unsafe { std::slice::from_raw_parts_mut((out_ptr + byte_start) as *mut u8, byte_len) };
+                detile_band(y_start, band);
+            });
+        } else {
+            detile_band(0, &mut out);
         }
         out
     }
@@ -811,6 +989,37 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "mode {mode}, {} B elements", 1 << e);
         }
+    }
+
+    /// Large (>= 512 KiB) tiled mip levels fan out across the persistent CPU pool in row bands
+    /// and must match element-by-element detiling byte for byte (including non-zero `base_xor`
+    /// and nested `pool::for_each` calls).
+    #[test]
+    fn large_level_row_parallel_detile_matches_element_by_element() {
+        let mut layout = Layout::new(26, 2, PipeConfig { pipes_log2: 5, pkrs_log2: 3 }).unwrap();
+        layout.base_xor = 0x180;
+        let c = Chain::new(layout, 512, 512, 1, 1);
+        let l = c.levels[0];
+        assert!(l.width * l.height * 4 >= 512 << 10, "exercises row-parallel path");
+        let src: Vec<u8> = (0..c.slice_bytes).map(|k| ((k * 131) ^ (k >> 7)) as u8).collect();
+        let got = c.detile_level(&src, 0, 0);
+        let mut want = vec![0u8; l.width * l.height * 4];
+        for y in 0..l.height {
+            for x in 0..l.width {
+                let o = c.element_at(&l, x, y, 0);
+                want[(y * l.width + x) * 4..][..4].copy_from_slice(&src[o..o + 4]);
+            }
+        }
+        assert_eq!(got, want);
+
+        // Nested pool::for_each (as when title_textures detiles a batch of large textures) must not deadlock.
+        let hits = AtomicUsize::new(0);
+        pool::for_each(4, 4, &|_| {
+            let sub = c.detile_level(&src, 0, 0);
+            assert_eq!(sub.len(), want.len());
+            hits.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(hits.load(Ordering::Relaxed), 4);
     }
 }
 

@@ -1126,36 +1126,20 @@ unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>
     subresources_on(&picked, threads)
 }
 
-/// `subresources` of each (address, texture), in order, on up to `threads` threads.
+/// `subresources` of each (address, texture), in order, on up to `threads` persistent CPU workers.
 unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
     let threads = threads.min(picked.len());
     if threads <= 1 {
         return picked.iter().map(|&(va, tex)| subresources(va, tex)).collect();
     }
-    // the next texture to take; each thread hands back (index, subresources)
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut out: Vec<Vec<Subresource>> = (0..picked.len()).map(|_| Vec::new()).collect();
-    let done: Vec<Vec<(usize, Vec<Subresource>)>> = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(va, tex)) = picked.get(k) else { break };
-                        // SAFETY: as in the serial path – the title's memory is only read
-                        mine.push((k, unsafe { subresources(va, tex) }));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    let slots: Vec<Mutex<Vec<Subresource>>> = (0..picked.len()).map(|_| Mutex::new(Vec::new())).collect();
+    crate::gpu::tiling::pool::for_each(picked.len(), threads, &|k| {
+        let (va, tex) = picked[k];
+        // SAFETY: as in the serial path – the title's memory is only read
+        let subs = unsafe { subresources(va, tex) };
+        *slots[k].lock().unwrap() = subs;
     });
-    for (k, subs) in done.into_iter().flatten() {
-        out[k] = subs;
-    }
-    out
+    slots.into_iter().map(|m| m.into_inner().unwrap()).collect()
 }
 
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
