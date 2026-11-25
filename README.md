@@ -16,7 +16,7 @@
 | **Unicorn Overlord** | ⏳ | Untested here (playable upstream in XCL) |
 | **Fortnite** | ⏳ | Untested here (boots & runs offline upstream in XCL) |
 | **XDefiant** | ⏳ | Untested here (boots & runs offline upstream in XCL) |
-| **Unannounced Retail Title** | ⏳ | Untested here (menus upstream in XCL) |
+| **Unannounced Retail Title** | ⏳ | Untested here (menus at 30 FPS & enters 3D world upstream in XCL / VIctory) |
 
 ## Highlights
 
