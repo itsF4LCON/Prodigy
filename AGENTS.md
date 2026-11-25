@@ -73,8 +73,6 @@ test counts by hand.
   `Frame clock`, `prodigy run`, `Tests`, `e2e`, `Scripts`, `README`, `Docs`. No `fix:` / `feat(x):`.
 - Body: why, root cause, what was measured. One logical change per commit; every commit builds and
   passes the tests. Squash fixups before the PR is reviewed.
-- Disclose AI use in the PR's **AI use** section (tool, model, what it did). A trailer in the commit
-  (`Assisted-by: <tool> (<model>)`) is welcome but not required.
 
 ### Tests
 - A bug fix comes with a test that fails without the fix. New logic comes with a test of it.
