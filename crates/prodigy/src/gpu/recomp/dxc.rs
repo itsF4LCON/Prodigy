@@ -9,11 +9,11 @@
 //! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
@@ -685,7 +685,16 @@ fn cache_mutex_name(file: &Path) -> String {
 }
 
 fn normalized_cache_dir(dir: &Path) -> PathBuf {
+    static CANON: OnceLock<RwLock<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    let cache = CANON.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(hit) = cache.read().unwrap_or_else(|e| e.into_inner()).get(dir) {
+        return hit.clone();
+    }
     if let Ok(canonical) = std::fs::canonicalize(dir) {
+        let mut w = cache.write().unwrap_or_else(|e| e.into_inner());
+        if w.len() < 256 {
+            w.insert(dir.to_path_buf(), canonical.clone());
+        }
         return canonical;
     }
     let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -697,6 +706,56 @@ fn normalized_cache_dir(dir: &Path) -> PathBuf {
         }
     }
     absolute
+}
+
+/// Bounded in-memory DXIL cache (avoids repeated filesystem opens/reads/validations when
+/// multiple pipelines compile or look up the same HLSL within one run).
+struct DxilMemCache {
+    map: HashMap<CacheFlight, Arc<Vec<u8>>>,
+    order: VecDeque<CacheFlight>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl DxilMemCache {
+    fn new(limit: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), bytes: 0, limit }
+    }
+
+    fn get(&self, key: &CacheFlight) -> Option<Arc<Vec<u8>>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: CacheFlight, blob: Vec<u8>) {
+        if self.limit == 0 || blob.len() > self.limit {
+            return;
+        }
+        if self.map.contains_key(&key) {
+            return;
+        }
+        let len = blob.len();
+        while self.bytes + len > self.limit {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(removed) = self.map.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(removed.len());
+            }
+        }
+        self.bytes += len;
+        self.order.push_back(key.clone());
+        self.map.insert(key, Arc::new(blob));
+    }
+}
+
+fn mem_cache() -> &'static RwLock<DxilMemCache> {
+    static CACHE: OnceLock<RwLock<DxilMemCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mib = std::env::var("PRODIGY_DXIL_MEM_CACHE_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .min(512);
+        RwLock::new(DxilMemCache::new(mib << 20))
+    })
 }
 
 fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
@@ -785,8 +844,14 @@ where
 {
     let key = cache_key(src, entry, profile);
     let dir = normalized_cache_dir(dir);
+    let mem_key = (dir.clone(), key);
+    if let Some(b) = mem_cache().read().unwrap_or_else(|e| e.into_inner()).get(&mem_key) {
+        counters.hits.fetch_add(1, Ordering::Relaxed);
+        return Ok((b.as_ref().clone(), true));
+    }
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
+        mem_cache().write().unwrap_or_else(|e| e.into_inner()).insert(mem_key, b.clone());
         counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
@@ -798,11 +863,16 @@ where
         return Err("DXIL not compiled yet".into());
     }
     counters.misses.fetch_add(1, Ordering::Relaxed);
-    let flight = cache_flight((dir.clone(), key));
+    let flight = cache_flight(mem_key.clone());
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
+    if let Some(b) = mem_cache().read().unwrap_or_else(|e| e.into_inner()).get(&mem_key) {
+        counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
+        return Ok((b.as_ref().clone(), true));
+    }
     if let Some(b) = cached_file(&file) {
+        mem_cache().write().unwrap_or_else(|e| e.into_inner()).insert(mem_key, b.clone());
         counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
@@ -837,6 +907,7 @@ where
             let _ = std::fs::remove_file(&tmp);
         }
     }
+    mem_cache().write().unwrap_or_else(|e| e.into_inner()).insert(mem_key, b.clone());
     Ok((b, false))
 }
 
@@ -1247,5 +1318,28 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn mem_cache_serves_without_disk_and_evicts_fifo() {
+        let mut cache = DxilMemCache::new(100);
+        let dir = PathBuf::from("mem-test");
+        cache.insert((dir.clone(), 1), vec![1u8; 60]);
+        cache.insert((dir.clone(), 2), vec![2u8; 60]);
+        assert!(cache.get(&(dir.clone(), 1)).is_none(), "oldest entry evicted when over budget");
+        assert_eq!(cache.get(&(dir.clone(), 2)).unwrap().len(), 60);
+        assert_eq!(cache.bytes, 60);
+
+        let disk_dir = std::env::temp_dir().join(format!("prodigy-dxil-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&disk_dir);
+        let dxil = synthetic_dxil(42);
+        let (first, hit) = compile_cached_in_with(&disk_dir, "mem cached src", "main", "cs_6_6", || Ok(dxil.clone())).unwrap();
+        assert!(!hit);
+        assert_eq!(first, dxil);
+        // Remove the on-disk file; the in-memory cache must still satisfy the lookup without recompiling.
+        let _ = std::fs::remove_dir_all(&disk_dir);
+        let (second, hit) = compile_cached_in_with(&disk_dir, "mem cached src", "main", "cs_6_6", || panic!("should hit memory cache")).unwrap();
+        assert!(hit);
+        assert_eq!(second, dxil);
     }
 }
