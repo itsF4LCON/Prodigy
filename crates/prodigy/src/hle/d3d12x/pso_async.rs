@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -111,7 +111,9 @@ impl Pending {
 }
 
 /// stand-in handed to the title → its real pipeline
-static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+static PENDING: RwLock<Option<HashMap<usize, Arc<Pending>>>> = RwLock::new(None);
+/// Number of entries currently in `PENDING` (fast-path skip when 0).
+static PENDING_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
@@ -210,7 +212,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         late: Default::default(),
         demand: Default::default(),
     });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    if PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone()).is_none() {
+        PENDING_LEN.fetch_add(1, Ordering::Release);
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -458,15 +462,38 @@ mod used_tests {
         released(known);
         released(unknown);
     }
+
+    #[test]
+    fn resolve_for_bind_uses_fast_path_and_tracks_pending_len() {
+        let cs = 0x7E57_C001usize;
+        let gfx = 0x7E57_C002usize;
+        submit_lazy(cs, true, Box::new(|| 0xAA01), 0);
+        submit_lazy(gfx, false, Box::new(|| 0xAA02), 0);
+        assert!(PENDING_LEN.load(Ordering::Acquire) >= 2);
+        // Compute bind builds synchronously on first use, then hits the lock-free real fast path.
+        assert_eq!(resolve_for_bind(cs), 0xAA01);
+        assert_eq!(resolve_for_bind(cs), 0xAA01);
+        // Graphics bind kicks off background build and resolves once ready.
+        let _ = resolve_for_bind(gfx);
+        let start = std::time::Instant::now();
+        while is_pending(gfx) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(resolve_for_bind(gfx), 0xAA02);
+        assert_eq!(released(cs), 0xAA01);
+        assert_eq!(released(gfx), 0xAA02);
+        assert_eq!(released(cs), 0);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
-    PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
+    if PENDING_LEN.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    PENDING.read().unwrap().as_ref()?.get(&pso).cloned()
 }
 
-/// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
-pub fn resolve(pso: usize) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+fn resolve_entry(p: Arc<Pending>, pso: usize) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
@@ -480,16 +507,33 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
+/// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
+pub fn resolve(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    resolve_entry(p, pso)
+}
+
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    let Some(p) = entry(pso) else { return pso };
+    resolve_wait_entry(p, pso, wait_budget())
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+#[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_wait_entry(p, pso, budget)
+}
+
+fn resolve_wait_entry(p: Arc<Pending>, pso: usize, budget: Option<std::time::Duration>) -> usize {
     p.note_use();
+    // Lock-free fast path once the real pipeline has been built.
+    let r = p.real.load(Ordering::Acquire);
+    if r != 0 {
+        return r;
+    }
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
@@ -551,10 +595,11 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
-    match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
-        None => pso,
+    let Some(p) = entry(pso) else { return pso };
+    if p.compute {
+        resolve_wait_entry(p, pso, wait_budget())
+    } else {
+        resolve_entry(p, pso)
     }
 }
 
@@ -562,7 +607,8 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
-    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let Some(p) = PENDING.write().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    PENDING_LEN.fetch_sub(1, Ordering::AcqRel);
     let done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)
@@ -580,6 +626,6 @@ pub fn is_pending(pso: usize) -> bool {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+    let pending = PENDING.read().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }

@@ -705,7 +705,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 take_written(base, size, &mut buf, &mut dirty, &mut page);
             }
         });
-        dirty.sort_unstable();
+        if dirty.windows(2).any(|w| w[0] > w[1]) {
+            dirty.sort_unstable();
+        }
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
