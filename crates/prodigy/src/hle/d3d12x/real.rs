@@ -4691,6 +4691,62 @@ fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
     pso::rect_list_gs(vs)
 }
 
+/// Whether `fmt` is an integer (`*_UINT` / `*_SINT`) DXGI format that D3D12 forbids blending on.
+fn is_integer_dxgi_format(fmt: u32) -> bool {
+    matches!(
+        fmt,
+        3 | 4   // R32G32B32A32_UINT / SINT
+        | 7 | 8 // R32G32B32_UINT / SINT
+        | 12 | 14 // R16G16B16A16_UINT / SINT
+        | 17 | 18 // R32G32_UINT / SINT
+        | 25      // R10G10B10A2_UINT
+        | 30 | 32 // R8G8B8A8_UINT / SINT
+        | 36 | 38 // R16G16_UINT / SINT
+        | 42 | 43 // R32_UINT / SINT
+        | 50 | 52 // R8G8_UINT / SINT
+        | 57 | 59 // R16_UINT / SINT
+        | 62 | 64 // R8_UINT / SINT
+    )
+}
+
+/// D3D12 rejects graphics PSOs that enable blending on an integer render target format.
+/// When a mixed MRT uses `IndependentBlendEnable == FALSE` with `RenderTarget[0].BlendEnable`,
+/// promote to independent blending and disable blending only on the integer targets so float/UNORM
+/// targets keep their blend state.
+fn sanitize_integer_rtv_blending(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    let n = (g.NumRenderTargets as usize).min(8);
+    if n == 0 {
+        return;
+    }
+    let any_int = (0..n).any(|i| is_integer_dxgi_format(g.RTVFormats[i].0 as u32));
+    if !any_int {
+        return;
+    }
+    if !g.BlendState.IndependentBlendEnable.as_bool() {
+        if g.BlendState.RenderTarget[0].BlendEnable.as_bool() {
+            let all_int = (0..n).all(|i| is_integer_dxgi_format(g.RTVFormats[i].0 as u32));
+            if all_int {
+                g.BlendState.RenderTarget[0].BlendEnable = false.into();
+            } else {
+                let base = g.BlendState.RenderTarget[0];
+                g.BlendState.IndependentBlendEnable = true.into();
+                for i in 0..n {
+                    g.BlendState.RenderTarget[i] = base;
+                    if is_integer_dxgi_format(g.RTVFormats[i].0 as u32) {
+                        g.BlendState.RenderTarget[i].BlendEnable = false.into();
+                    }
+                }
+            }
+        }
+    } else {
+        for i in 0..n {
+            if is_integer_dxgi_format(g.RTVFormats[i].0 as u32) && g.BlendState.RenderTarget[i].BlendEnable.as_bool() {
+                g.BlendState.RenderTarget[i].BlendEnable = false.into();
+            }
+        }
+    }
+}
+
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
 /// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
 /// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
@@ -4701,6 +4757,7 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     for f in g.RTVFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
     }
+    sanitize_integer_rtv_blending(g);
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
     }
@@ -5979,5 +6036,53 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+
+    #[test]
+    fn sanitize_integer_rtv_blending_disables_blend_on_integer_targets_only() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_UNORM};
+
+        // 1. All-integer target with shared blend enabled -> BlendEnable turned off, IndependentBlendEnable stays false.
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.NumRenderTargets = 1;
+        g.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+        g.BlendState.RenderTarget[0].BlendEnable = true.into();
+        sanitize_integer_rtv_blending(&mut g);
+        assert!(!g.BlendState.IndependentBlendEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[0].BlendEnable.as_bool());
+
+        // 2. Mixed UNORM + UINT MRT with shared blend -> promotes to independent blend, keeping UNORM blended.
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.NumRenderTargets = 2;
+        g.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UINT;
+        g.BlendState.RenderTarget[0].BlendEnable = true.into();
+        g.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        sanitize_integer_rtv_blending(&mut g);
+        assert!(g.BlendState.IndependentBlendEnable.as_bool());
+        assert!(g.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(g.BlendState.RenderTarget[1].RenderTargetWriteMask, 0xF);
+
+        // 3. IndependentBlendEnable already true -> clears only the integer slot.
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.NumRenderTargets = 2;
+        g.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+        g.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.BlendState.IndependentBlendEnable = true.into();
+        g.BlendState.RenderTarget[0].BlendEnable = true.into();
+        g.BlendState.RenderTarget[1].BlendEnable = true.into();
+        sanitize_integer_rtv_blending(&mut g);
+        assert!(!g.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        assert!(g.BlendState.RenderTarget[1].BlendEnable.as_bool());
+
+        // 4. Pure UNORM targets -> untouched.
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.NumRenderTargets = 1;
+        g.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.BlendState.RenderTarget[0].BlendEnable = true.into();
+        sanitize_integer_rtv_blending(&mut g);
+        assert!(!g.BlendState.IndependentBlendEnable.as_bool());
+        assert!(g.BlendState.RenderTarget[0].BlendEnable.as_bool());
     }
 }
