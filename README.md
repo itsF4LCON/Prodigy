@@ -7,13 +7,16 @@
 
 ## Compatibility
 
-| Game | Status | Notes |
+> [!NOTE]
+> Game compatibility has **not yet been directly tested** on Prodigy's recent changes. The statuses below reflect upstream reports from [XCL](https://github.com/ivall/xcl) and [VIctory](https://github.com/Marvisak/VIctory).
+
+| Game | Upstream Status | Notes |
 | :--- | :---: | :--- |
-| **Minecraft Preview** | ✅ | Playable |
-| **Unicorn Overlord** | ✅ | Playable |
-| **Fortnite** | ✅ | Boots & runs offline (no multiplayer servers) |
-| **XDefiant** | ✅ | Boots & runs offline (official servers shut down) |
-| **Unannounced Retail Title** | 🚧 | Boots to menus (~30 FPS); in-game gameplay not reached yet |
+| **Minecraft Preview** | ⏳ | Untested here (playable upstream in XCL) |
+| **Unicorn Overlord** | ⏳ | Untested here (playable upstream in XCL) |
+| **Fortnite** | ⏳ | Untested here (boots & runs offline upstream in XCL) |
+| **XDefiant** | ⏳ | Untested here (boots & runs offline upstream in XCL) |
+| **Unannounced Retail Title** | ⏳ | Untested here (menus upstream in XCL) |
 
 ## Highlights
 
