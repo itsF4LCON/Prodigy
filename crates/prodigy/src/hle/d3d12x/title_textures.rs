@@ -858,10 +858,16 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+            if super::vram::is_unmapped_tiled(r.as_raw() as usize) {
+                continue;
+            }
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
             batch.push((r, subs, states));
+        }
+        if batch.is_empty() {
+            continue;
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };

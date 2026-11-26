@@ -911,17 +911,23 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         Some(hr) => hr,
         None => {
             let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let l0 = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
             let mut hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
             if hr == windows::Win32::Foundation::E_OUTOFMEMORY.0 {
                 // Local VRAM (L1) exhausted (e.g. 6 GiB GPU streaming world textures): spill to
                 // GPU-accessible system memory (L0) instead of failing the title.
-                let l0 = D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_CUSTOM,
-                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
-                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-                    ..Default::default()
-                };
                 hr = real::dev_create_committed_resource(this, &l0 as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+            }
+            if hr == windows::Win32::Foundation::E_OUTOFMEMORY.0 && super::vram::reclaim_on_oom(this, 16 << 20) > 0 {
+                hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+                if hr == windows::Win32::Foundation::E_OUTOFMEMORY.0 {
+                    hr = real::dev_create_committed_resource(this, &l0 as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+                }
             }
             hr
         }

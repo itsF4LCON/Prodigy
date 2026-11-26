@@ -453,16 +453,22 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         for k in 0..compile_threads() {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("prodigy-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let _slot = wait_for_memory(&job.wanted);
-                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
-                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = job.reply.send(r);
+            let _ = std::thread::Builder::new().name(format!("prodigy-dxc-{k}")).stack_size(DXC_STACK).spawn(move || {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
+                loop {
+                    let job = match rx.lock().unwrap().recv() {
+                        Ok(j) => j,
+                        Err(_) => return,
+                    };
+                    let _slot = wait_for_memory(&job.wanted);
+                    let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                        .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
+                    let _ = job.reply.send(r);
+                }
             });
         }
         std::sync::Mutex::new(tx)

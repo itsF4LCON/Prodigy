@@ -198,8 +198,16 @@ pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
 
+static ADAPTER_VRAM_MB: AtomicU64 = AtomicU64::new(0);
+
+/// Dedicated VRAM of the active D3D12 adapter in MiB (0 if unknown / null backend).
+pub(super) fn adapter_vram_mb() -> u64 {
+    ADAPTER_VRAM_MB.load(Ordering::Relaxed)
+}
+
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
 pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
+    let p = crate::hle::kernelx::mirrors::source(p).unwrap_or(p);
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
     let (base, size) = u.window(k);
@@ -211,6 +219,7 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
 
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
 pub fn uma_va_of(p: usize) -> Option<u64> {
+    let p = crate::hle::kernelx::mirrors::source(p).unwrap_or(p);
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
     Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
@@ -525,7 +534,9 @@ pub fn init() -> Result<String, String> {
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
-                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    let vram_mb = (desc.DedicatedVideoMemory >> 20) as u64;
+                    ADAPTER_VRAM_MB.store(vram_mb, Ordering::Relaxed);
+                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), vram_mb);
                     break;
                 }
             }
@@ -985,6 +996,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (17, l::copy_resource_x as usize),
                 (19, l::resolve_subresource_x as usize),
                 (51, l::clear_depth_stencil_x as usize),
+                (53, l::clear_uav_uint_x as usize),
+                (54, l::clear_uav_float_x as usize),
                 (108, l::resolve_subresource_region_x as usize),
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
@@ -2885,7 +2898,25 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
         d.Properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     }
     d.SizeInBytes = d.SizeInBytes.div_ceil(0x1_0000) * 0x1_0000;
-    let hr2 = dev_create_heap_pc(this, &d as *const _ as usize, riid, ppv);
+    let mut hr2 = dev_create_heap_pc(this, &d as *const _ as usize, riid, ppv);
+    if hr2 == windows::Win32::Foundation::E_OUTOFMEMORY.0 {
+        let mut l0 = d;
+        if l0.Properties.Type == D3D12_HEAP_TYPE_DEFAULT {
+            l0.Properties = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            hr2 = dev_create_heap_pc(this, &l0 as *const _ as usize, riid, ppv);
+        }
+        if hr2 == windows::Win32::Foundation::E_OUTOFMEMORY.0 && super::vram::reclaim_on_oom(this, (d.SizeInBytes as usize).max(16 << 20)) > 0 {
+            hr2 = dev_create_heap_pc(this, &d as *const _ as usize, riid, ppv);
+            if hr2 == windows::Win32::Foundation::E_OUTOFMEMORY.0 && d.Properties.Type == D3D12_HEAP_TYPE_DEFAULT {
+                hr2 = dev_create_heap_pc(this, &l0 as *const _ as usize, riid, ppv);
+            }
+        }
+    }
     if hr2 >= 0 {
         note_heap_uma(desc, ppv);
     }
@@ -5430,11 +5461,17 @@ pub fn drain_gpu() {
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     unsafe {
-        // a fence per queue (they finish in any order)
+        // a fence per queue (title queues + Prodigy's texture upload queues; they finish in any order)
         let mut fences = Vec::new();
-        for q in super::present::known_queues() {
-            let qr = q as *mut c_void;
-            let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qr) else { continue };
+        let mut queues: Vec<ID3D12CommandQueue> = super::present::known_queues()
+            .into_iter()
+            .filter_map(|q| {
+                let qr = q as *mut c_void;
+                ID3D12CommandQueue::from_raw_borrowed(&qr).cloned()
+            })
+            .collect();
+        queues.extend(super::title_textures::upload_queues());
+        for q in &queues {
             let submit = || {
                 let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
