@@ -286,7 +286,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let (orig_args_off, orig_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if args != 0 {
+        if let Some((va, _)) = super::real::console_buffer(args) {
+            super::sparse::ensure_buffer_range_mapped(args, va, orig_args_off as usize, (max as usize).max(1).saturating_mul(64));
+        }
+    }
+    if count_buf != 0 {
+        if let Some((va, _)) = super::real::console_buffer(count_buf) {
+            super::sparse::ensure_buffer_range_mapped(count_buf, va, orig_count_off as usize, 64);
+        }
+    }
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
         // the list may hold Prodigy's ABI root signature from a translated draw before it – the PC
@@ -647,8 +658,12 @@ unsafe fn translated_dispatch_mesh(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let real = super::pso_async::resolve_wait(pso);
+    if !super::real::is_translated_graphics(real) {
+        if super::pso_async::is_pending(pso) {
+            count(DRAWS_SKIPPED);
+            return None;
+        }
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)

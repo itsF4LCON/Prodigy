@@ -156,13 +156,19 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("prodigy-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    build(&p, job, false);
+            let _ = std::thread::Builder::new().name(format!("prodigy-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
+                loop {
+                    let next = rx.lock().unwrap().recv();
+                    let Ok(p) = next else { return };
+                    // (None: a bind took it and builds it itself)
+                    let job = p.job.lock().unwrap().take();
+                    if let Some(job) = job {
+                        build(&p, job, false);
+                    }
                 }
             });
         }

@@ -62,6 +62,23 @@ impl<H: Clone> Arenas<H> {
         self.list.retain(|a| a.users > 0 || a.idle_since.is_none_or(|t| now.duration_since(t) < IDLE));
     }
 
+    /// Under OOM pressure, take every idle arena's heap so the caller can drop them after
+    /// draining the GPU queues.
+    fn sweep_all_idle(&mut self, out: &mut Vec<H>) -> usize {
+        let mut freed = 0;
+        let mut keep = Vec::with_capacity(self.list.len());
+        for a in self.list.drain(..) {
+            if a.users > 0 {
+                keep.push(a);
+            } else {
+                freed += a.size;
+                out.push(a.heap);
+            }
+        }
+        self.list = keep;
+        freed
+    }
+
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
     /// (heap, offset, arena id); None: no heap.
@@ -159,8 +176,8 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
 
 /// bytes of a page – of the title's addresses and of a tile
 const PAGE: usize = 0x1_0000;
-/// pages of a video-memory pool heap (64 MiB)
-const POOL_PAGES: u32 = 1024;
+/// pages of a video-memory pool heap (16 MiB: finer-grained retirement on low-VRAM GPUs)
+const POOL_PAGES: u32 = 256;
 /// a page no target uses any more is kept this long for the next target at its address (with
 /// what it holds – a title may make a target again over memory it rendered to)
 const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -230,7 +247,7 @@ struct Pages {
     fence: ID3D12Fence,
     value: u64,
     next_seq: u64,
-    pools: Vec<ID3D12Heap>,
+    pools: Vec<Option<ID3D12Heap>>,
     free: Vec<Tile>,
     /// tiles given back, reusable after `COOL`
     cooling: std::collections::VecDeque<(Tile, std::time::Instant)>,
@@ -247,6 +264,8 @@ struct Pages {
     waited: std::collections::HashMap<usize, u64>,
     /// heap flags for pool heaps (NONE on Tier 2; ALLOW_ONLY_*_TEXTURES on Tier 1)
     heap_flags: D3D12_HEAP_FLAGS,
+    /// backoff after CreateHeap OOM so we don't spam failing CreateHeap calls per 64 KiB tile
+    oom_until: Option<std::time::Instant>,
 }
 
 // D3D12 objects are free-threaded
@@ -254,6 +273,25 @@ unsafe impl Send for Pages {}
 
 /// (device raw pointer, heap_flags) → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<(usize, i32), Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
+
+thread_local! {
+    /// True while this thread holds `PAGES` (prevents re-entrant deadlock when `Pages::take_tile`
+    /// calls `dev.CreateHeap` and `real::dev_create_heap` would otherwise call `reclaim_on_oom`).
+    static IN_PAGES_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct PagesLockGuard;
+impl PagesLockGuard {
+    fn enter() -> Self {
+        IN_PAGES_LOCK.with(|c| c.set(true));
+        Self
+    }
+}
+impl Drop for PagesLockGuard {
+    fn drop(&mut self) {
+        IN_PAGES_LOCK.with(|c| c.set(false));
+    }
+}
 
 fn page_heap_flags(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> D3D12_HEAP_FLAGS {
     if tier2(dev) {
@@ -264,6 +302,21 @@ fn page_heap_flags(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> D3D12_HEAP
         D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES
     } else {
         D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+    }
+}
+
+/// Soft cap on `Pages` pool heaps (each 16 MiB) for low-VRAM GPUs (<= 8 GiB) so sampled
+/// streaming textures proactively LRU-evict instead of pushing WDDM into OOM.
+fn pool_cap_heaps() -> Option<usize> {
+    if let Ok(v) = std::env::var("PRODIGY_VRAM_POOL_CAP_MB") {
+        let mb: usize = v.trim().parse().ok()?;
+        return (mb > 0).then(|| (mb / (POOL_PAGES as usize * PAGE >> 20)).max(8));
+    }
+    let vram_mb = super::real::adapter_vram_mb();
+    if (1..=8192).contains(&vram_mb) {
+        Some(2048 / (POOL_PAGES as usize * PAGE >> 20))
+    } else {
+        None
     }
 }
 
@@ -293,6 +346,7 @@ impl Pages {
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
             heap_flags,
+            oom_until: None,
         })
     }
 
@@ -308,77 +362,229 @@ impl Pages {
         if self.cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
             return self.cooling.pop_front().map(|(t, _)| t);
         }
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            // every kind of texture (resource heap tier 2: the only flags for both)
-            Flags: self.heap_flags,
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-            let l0_desc = D3D12_HEAP_DESC {
-                Properties: D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_CUSTOM,
-                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
-                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-                    ..Default::default()
-                },
-                ..desc
+        let now = std::time::Instant::now();
+        let active_pools = self.pools.iter().filter(|p| p.is_some()).count();
+        let at_cap = pool_cap_heaps().is_some_and(|cap| active_pools >= cap);
+        let try_heap = !at_cap && self.oom_until.is_none_or(|t| now >= t);
+        if try_heap {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                // every kind of texture (resource heap tier 2: the only flags for both)
+                Flags: self.heap_flags,
             };
-            if let Err(e2) = super::title_textures::own_work(|| dev.CreateHeap(&l0_desc, &mut heap)) {
-                // Under GPU memory pressure, reclaim any idle/cooling tiles immediately instead of OOMing.
-                let now = std::time::Instant::now();
-                while let Some((key, since)) = self.idle.pop_front() {
-                    let still_idle = |p: &Page| p.idle_since == Some(since);
-                    let page = match key {
-                        PageKey::Own(a) if self.pages.get(&a).is_some_and(still_idle) => self.pages.remove(&a),
-                        PageKey::Extra(va, i) if self.extra_pages.get(&(va, i)).is_some_and(still_idle) => self.extra_pages.remove(&(va, i)),
-                        _ => None,
+            let _guard = PagesLockGuard::enter();
+            let mut heap: Option<ID3D12Heap> = None;
+            let ok = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)).is_ok()
+                || {
+                    let l0_desc = D3D12_HEAP_DESC {
+                        Properties: D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_CUSTOM,
+                            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                            ..Default::default()
+                        },
+                        ..desc
                     };
-                    if let Some(p) = page {
-                        self.cooling.push_back((p.tile, now));
+                    super::title_textures::own_work(|| dev.CreateHeap(&l0_desc, &mut heap)).is_ok()
+                };
+            if ok {
+                self.oom_until = None;
+                let heap = heap?;
+                let h = match self.pools.iter().position(|p| p.is_none()) {
+                    Some(i) => {
+                        self.pools[i] = Some(heap);
+                        i as u32
                     }
-                }
-                if let Some((t, _)) = self.cooling.pop_front() {
-                    return Some(t);
-                }
-                // Still out of GPU memory: LRU-evict oldest mapped sampled textures until a tile
-                // becomes free so streaming stays within the WDDM GPU memory ceiling instead of OOMing.
-                while let Some(&victim_key) = self
-                    .targets
-                    .iter()
-                    .filter(|(&k, t)| k != exclude && t.mapped && !t.gpu_owned && (!t.used.is_empty() || !t.used_extra.is_empty()))
-                    .min_by_key(|(_, t)| t.seq)
-                    .map(|(k, _)| k)
-                {
-                    let (total, used, used_extra) = {
-                        let t = self.targets.get_mut(&victim_key).unwrap();
-                        t.mapped = false;
-                        (t.total, std::mem::take(&mut t.used), std::mem::take(&mut t.used_extra))
-                    };
-                    let raw = victim_key as *mut c_void;
-                    if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
-                        self.unmap(res, total);
+                    None => {
+                        self.pools.push(Some(heap));
+                        self.pools.len() as u32 - 1
                     }
-                    self.release_tiles(used, used_extra, now, true);
-                    static EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n == 1 || (n.is_power_of_two() && n >= 64) {
-                        crate::xlog_info!("D3D12.X: VRAM pressure: LRU-evicted {n} sampled tiled texture(s) to stay within GPU memory");
-                    }
-                    if let Some((t, _)) = self.cooling.pop_front() {
-                        return Some(t);
-                    }
-                }
-                crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e}; L0: {e2})");
-                return None;
+                };
+                self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
+                return Some((h, 0));
+            }
+            self.oom_until = Some(now + std::time::Duration::from_secs(2));
+        }
+        // Under GPU memory pressure: drain all idle & cooling tiles straight into `self.free`
+        // so subsequent tiles of this texture reuse them without repeating CreateHeap.
+        while let Some((key, since)) = self.idle.pop_front() {
+            let still_idle = |p: &Page| p.idle_since == Some(since);
+            let page = match key {
+                PageKey::Own(a) if self.pages.get(&a).is_some_and(still_idle) => self.pages.remove(&a),
+                PageKey::Extra(va, i) if self.extra_pages.get(&(va, i)).is_some_and(still_idle) => self.extra_pages.remove(&(va, i)),
+                _ => None,
+            };
+            if let Some(p) = page {
+                self.free.push(p.tile);
             }
         }
-        self.pools.push(heap?);
-        let h = self.pools.len() as u32 - 1;
-        self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
-        Some((h, 0))
+        while let Some((t, _)) = self.cooling.pop_front() {
+            self.free.push(t);
+        }
+        if let Some(t) = self.free.pop() {
+            return Some(t);
+        }
+        // Still out of tiles: batch LRU-evict oldest mapped sampled textures until we have at
+        // least 64 free tiles (4 MiB) to amortize the scan and avoid per-tile stalls.
+        let mut victims: Vec<(u64, usize)> = self
+            .targets
+            .iter()
+            .filter(|(&k, t)| k != exclude && t.mapped && !t.gpu_owned && (!t.used.is_empty() || !t.used_extra.is_empty()))
+            .map(|(&k, t)| (t.seq, k))
+            .collect();
+        victims.sort_unstable_by_key(|&(seq, _)| seq);
+        for &(_, victim_key) in &victims {
+            let (total, used, used_extra) = {
+                let Some(t) = self.targets.get_mut(&victim_key) else { continue };
+                if !t.mapped {
+                    continue;
+                }
+                t.mapped = false;
+                (t.total, std::mem::take(&mut t.used), std::mem::take(&mut t.used_extra))
+            };
+            let raw = victim_key as *mut c_void;
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                self.unmap(res, total);
+            }
+            self.release_tiles(used, used_extra, now, true);
+            while let Some((t, _)) = self.cooling.pop_front() {
+                self.free.push(t);
+            }
+            static EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || (n.is_power_of_two() && n >= 64) {
+                crate::xlog_info!("D3D12.X: VRAM pressure: LRU-evicted {n} sampled tiled texture(s) to stay within GPU memory");
+            }
+            if self.free.len() >= 64 {
+                break;
+            }
+        }
+        if let Some(t) = self.free.pop() {
+            return Some(t);
+        }
+        // If we hit the soft cap and all sampled textures are already evicted, allow overflowing
+        // via CreateHeap so GPU-owned render targets never fail.
+        if at_cap && self.oom_until.is_none_or(|t| now >= t) {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: self.heap_flags,
+            };
+            let _guard = PagesLockGuard::enter();
+            let mut heap: Option<ID3D12Heap> = None;
+            if super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)).is_ok() {
+                let heap = heap?;
+                let h = match self.pools.iter().position(|p| p.is_none()) {
+                    Some(i) => {
+                        self.pools[i] = Some(heap);
+                        i as u32
+                    }
+                    None => {
+                        self.pools.push(Some(heap));
+                        self.pools.len() as u32 - 1
+                    }
+                };
+                self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
+                return Some((h, 0));
+            }
+            self.oom_until = Some(now + std::time::Duration::from_secs(2));
+        }
+        crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures (all sampled textures evicted)");
+        None
+    }
+
+    /// Detach any pool heaps whose tiles are all free/cooling into `out` so the caller can drop
+    /// them back to D3D12/WDDM after draining all GPU queues.
+    unsafe fn drop_empty_pools(&mut self, out: &mut Vec<ID3D12Heap>) -> usize {
+        let mut counts = vec![0u32; self.pools.len()];
+        for &(h, _) in &self.free {
+            if let Some(c) = counts.get_mut(h as usize) {
+                *c += 1;
+            }
+        }
+        for &((h, _), _) in &self.cooling {
+            if let Some(c) = counts.get_mut(h as usize) {
+                *c += 1;
+            }
+        }
+        let mut gone = vec![false; self.pools.len()];
+        let mut n_dropped = 0usize;
+        for (h, &c) in counts.iter().enumerate() {
+            if c == POOL_PAGES && self.pools[h].is_some() {
+                gone[h] = true;
+                if let Some(heap) = self.pools[h].take() {
+                    out.push(heap);
+                    n_dropped += 1;
+                }
+            }
+        }
+        if n_dropped == 0 {
+            return 0;
+        }
+        self.free.retain(|&(h, _)| !gone.get(h as usize).copied().unwrap_or(false));
+        self.cooling.retain(|&((h, _), _)| !gone.get(h as usize).copied().unwrap_or(false));
+        let t0 = std::time::Instant::now();
+        while self.fence.GetCompletedValue() < self.value && t0.elapsed() < std::time::Duration::from_millis(50) {
+            std::thread::yield_now();
+        }
+        n_dropped * POOL_PAGES as usize * PAGE
+    }
+
+    /// Evict idle pages and oldest sampled tiled textures until at least `target_bytes` of pool
+    /// heaps are detached into `out` (or no more evictable textures remain).
+    unsafe fn reclaim_for_oom(&mut self, target_bytes: usize, out: &mut Vec<ID3D12Heap>) -> usize {
+        let now = std::time::Instant::now();
+        self.oom_until = Some(now + std::time::Duration::from_secs(2));
+        while let Some((key, since)) = self.idle.pop_front() {
+            let still_idle = |p: &Page| p.idle_since == Some(since);
+            let page = match key {
+                PageKey::Own(a) if self.pages.get(&a).is_some_and(still_idle) => self.pages.remove(&a),
+                PageKey::Extra(va, i) if self.extra_pages.get(&(va, i)).is_some_and(still_idle) => self.extra_pages.remove(&(va, i)),
+                _ => None,
+            };
+            if let Some(p) = page {
+                self.cooling.push_back((p.tile, now));
+            }
+        }
+        let mut freed = self.drop_empty_pools(out);
+        if freed >= target_bytes {
+            return freed;
+        }
+        let mut victims: Vec<(u64, usize)> = self
+            .targets
+            .iter()
+            .filter(|(_, t)| t.mapped && !t.gpu_owned && (!t.used.is_empty() || !t.used_extra.is_empty()))
+            .map(|(&k, t)| (t.seq, k))
+            .collect();
+        victims.sort_unstable_by_key(|&(seq, _)| seq);
+        let mut evicted = 0usize;
+        for &(_, victim_key) in victims.iter().take(256) {
+            let (total, used, used_extra) = {
+                let Some(t) = self.targets.get_mut(&victim_key) else { continue };
+                if !t.mapped {
+                    continue;
+                }
+                t.mapped = false;
+                (t.total, std::mem::take(&mut t.used), std::mem::take(&mut t.used_extra))
+            };
+            let raw = victim_key as *mut c_void;
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                self.unmap(res, total);
+            }
+            self.release_tiles(used, used_extra, now, true);
+            evicted += 1;
+            if evicted % 32 == 0 {
+                freed += self.drop_empty_pools(out);
+                if freed >= target_bytes {
+                    return freed;
+                }
+            }
+        }
+        freed += self.drop_empty_pools(out);
+        freed
     }
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
@@ -398,7 +604,7 @@ impl Pages {
                 1,
                 Some(&coord),
                 Some(&region),
-                &self.pools[h as usize],
+                self.pools[h as usize].as_ref().unwrap(),
                 ranges.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -736,7 +942,7 @@ pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     g.iter().filter(|(&(d, _), _)| d == device).filter_map(|(_, p)| p.as_ref()).fold((0, 0), |(used, pools), p| {
-        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.iter().filter(|h| h.is_some()).count() * POOL_PAGES as usize * PAGE)
     })
 }
 
@@ -744,8 +950,54 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     g.values().flatten().fold((0, 0), |(used, pools), p| {
-        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.iter().filter(|h| h.is_some()).count() * POOL_PAGES as usize * PAGE)
     })
+}
+
+/// True when `res` is a tiled texture tracked by `Pages` whose tiles are currently unmapped
+/// (e.g. LRU-evicted under VRAM pressure). Callers must not `CopyTextureRegion` into it.
+pub(super) fn is_unmapped_tiled(res: usize) -> bool {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().any(|p| p.targets.get(&res).is_some_and(|t| !t.mapped))
+}
+
+/// Free idle arenas and LRU-evict sampled tiled textures to release whole pool heaps back to
+/// D3D12/WDDM when `CreateHeap` or `CreateCommittedResource` fails with `E_OUTOFMEMORY`.
+pub(super) unsafe fn reclaim_on_oom(dev: *mut c_void, target_bytes: usize) -> usize {
+    if IN_PAGES_LOCK.with(|c| c.get()) {
+        return 0;
+    }
+    let mut to_drop: Vec<ID3D12Heap> = Vec::new();
+    let freed = {
+        let _guard = PagesLockGuard::enter();
+        let mut freed = ARENAS.lock().unwrap().sweep_all_idle(&mut to_drop);
+        let dev_key = dev as usize;
+        let mut g = PAGES.lock().unwrap();
+        for (&(d, _), entry) in g.iter_mut() {
+            if d != dev_key {
+                continue;
+            }
+            let Some(pages) = entry.as_mut() else { continue };
+            freed += pages.reclaim_for_oom(target_bytes.saturating_sub(freed), &mut to_drop);
+            if freed >= target_bytes {
+                break;
+            }
+        }
+        freed
+    };
+    if !to_drop.is_empty() {
+        // Ensure all in-flight command lists on title queues finish before destroying heaps.
+        super::real::drain_gpu();
+        drop(to_drop);
+    }
+    if freed > 0 {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: VRAM OOM reclaim #{n}: freed {} MiB back to WDDM", freed >> 20);
+        }
+    }
+    freed
 }
 
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
@@ -889,11 +1141,21 @@ unsafe fn place_small(
         return None;
     }
     let dev_key = dev.as_raw() as usize;
-    let (heap_raw, h, off) = {
+    let try_alloc = || {
         let mut pools = SMALL_POOLS.lock().unwrap();
         let pool = pools.entry(dev_key).or_insert_with(SmallPool::new);
         let (h, off) = pool.alloc(dev, blocks)?;
-        (pool.heaps[h].0.as_raw() as usize, h, off)
+        Some((pool.heaps[h].0.as_raw() as usize, h, off))
+    };
+    let (heap_raw, h, off) = match try_alloc() {
+        Some(v) => v,
+        None => {
+            if reclaim_on_oom(this, SMALL_HEAP_BYTES) > 0 {
+                try_alloc()?
+            } else {
+                return None;
+            }
+        }
     };
     let hr = super::real::dev_create_placed_resource(this, heap_raw, off, &small_desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {

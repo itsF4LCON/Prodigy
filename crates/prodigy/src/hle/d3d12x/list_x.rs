@@ -3901,6 +3901,40 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 
+const PC_CLEAR_UAV_UINT: usize = 49;
+const PC_CLEAR_UAV_FLOAT: usize = 50;
+
+unsafe fn clear_uav_x(this: *mut c_void, pc_slot: usize, gpu: u64, cpu: u64, res: usize, values: *const u32, num_rects: u32, rects: *const c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const u32, u32, *const c_void);
+    let f = pc::<F>(this, pc_slot);
+    if res == 0 || values.is_null() {
+        return;
+    }
+    match (super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
+        (Some(g), Some(c)) => {
+            if g.pc_gpu_uav != 0 && c.pc_uav != 0 {
+                f(this, g.pc_gpu_uav, c.pc_uav, res, values, num_rects, rects);
+            }
+        }
+        (None, None) => {
+            f(this, gpu, cpu, res, values, num_rects, rects);
+        }
+        _ => {}
+    }
+}
+
+/// command list #53 ClearUnorderedAccessViewUint (PC #49): translate console UMA descriptor
+/// handles to PC UAV handles (used by amd_fidelityfx_upscaler_xbox.dll / FSR4).
+pub(super) unsafe extern "system" fn clear_uav_uint_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, num_rects: u32, rects: *const c_void) {
+    clear_uav_x(this, PC_CLEAR_UAV_UINT, gpu, cpu, res, values, num_rects, rects);
+}
+
+/// command list #54 ClearUnorderedAccessViewFloat (PC #50): translate console UMA descriptor
+/// handles to PC UAV handles.
+pub(super) unsafe extern "system" fn clear_uav_float_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, num_rects: u32, rects: *const c_void) {
+    clear_uav_x(this, PC_CLEAR_UAV_FLOAT, gpu, cpu, res, values, num_rects, rects);
+}
+
 const PC_RESOLVE_SUBRESOURCE: usize = 19;
 const PC_RESOLVE_SUBRESOURCE_REGION: usize = 64;
 

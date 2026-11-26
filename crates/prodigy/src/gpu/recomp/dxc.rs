@@ -390,8 +390,21 @@ const WANTED_AT_ONCE: usize = 6;
 pub fn compile_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
+        if let Some(n) = std::env::var("PRODIGY_DXC_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return n.clamp(1, 64);
+        }
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("PRODIGY_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+        let mut default = cores.saturating_sub(1);
+        // On <= 16 GiB RAM systems, spawning 16+ DXC + PSO workers drives commit past RAM and
+        // causes heavy pagefile thrashing (audio crackles and slower compiles). Cap to 4 unless
+        // overridden with PRODIGY_DXC_THREADS.
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 && m.ullTotalPhys <= (18u64 << 30) {
+            default = default.min(4);
+        }
+        default.clamp(1, 64)
     })
 }
 
@@ -453,16 +466,22 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         for k in 0..compile_threads() {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("prodigy-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let _slot = wait_for_memory(&job.wanted);
-                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
-                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = job.reply.send(r);
+            let _ = std::thread::Builder::new().name(format!("prodigy-dxc-{k}")).stack_size(DXC_STACK).spawn(move || {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
+                loop {
+                    let job = match rx.lock().unwrap().recv() {
+                        Ok(j) => j,
+                        Err(_) => return,
+                    };
+                    let _slot = wait_for_memory(&job.wanted);
+                    let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                        .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
+                    let _ = job.reply.send(r);
+                }
             });
         }
         std::sync::Mutex::new(tx)
@@ -478,6 +497,14 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 }
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    // Guard against pathological decompiled HLSL (e.g. 30–173 MiB text): Clang/LLVM's AST expands
+    // ~300-400x and burns 70+ GiB of RAM even at -O0, hitting Windows' commit limit.
+    let max_mb: usize = std::env::var("PRODIGY_DXC_MAX_HLSL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    if max_mb > 0 && src.len() > (max_mb << 20) {
+        let msg = format!("DXC: skipping oversized {profile} shader ({} KiB HLSL > {max_mb} MiB cap)", src.len() >> 10);
+        crate::xlog_warn!("{msg}");
+        return Err(msg);
+    }
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
@@ -488,10 +515,21 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
+        let opt = if let Ok(v) = std::env::var("PRODIGY_DXC_OPT") {
+            let v = v.trim();
+            if v.starts_with("-O") { Some(v.to_string()) } else { None }
+        } else if src.len() > 2 * 1024 * 1024 {
+            Some("-O0".to_string())
+        } else if src.len() > 256 * 1024 {
+            Some("-O1".to_string())
+        } else {
+            None
+        };
+        if let Some(ref flag) = opt {
+            args.push(crate::util::wide(flag));
+        }
+        if src.len() > 512 * 1024 {
+            crate::xlog_info!("DXC: compiling large {profile} shader ({} KiB HLSL, {})", src.len() >> 10, opt.as_deref().unwrap_or("-O3"));
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));

@@ -606,8 +606,23 @@ impl State {
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
-            crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
+        let l0 = D3D12_HEAP_DESC {
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            ..desc
+        };
+        let mut ok = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)).is_ok()
+            || super::title_textures::own_work(|| self.dev.CreateHeap(&l0, &mut heap)).is_ok();
+        if !ok && super::vram::reclaim_on_oom(self.dev.as_raw(), POOL_TILES as usize * TILE) > 0 {
+            ok = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)).is_ok()
+                || super::title_textures::own_work(|| self.dev.CreateHeap(&l0, &mut heap)).is_ok();
+        }
+        if !ok {
+            crate::xlog_warn!("sparse windows: no video memory for more tiles (L1+L0 OOM after reclaim)");
             return None;
         }
         let heap = heap?;
@@ -1572,6 +1587,42 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
     Some((hr, delta))
+}
+
+/// Ensure the tile(s) covering `[va + offset, va + offset + len)` are mapped on a sparse placed
+/// buffer `res` (e.g. before `ExecuteIndirect` reads indirect arguments from a region that was
+/// uncommitted when `place_buffer` ran).
+pub unsafe fn ensure_buffer_range_mapped(res: usize, va: usize, offset: usize, len: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if !s.buffers.contains_key(&res) {
+        return;
+    }
+    let res_base = va & !(TILE - 1);
+    let Some(start) = va.checked_add(offset).map(|a| a & !(TILE - 1)) else { return };
+    let Some(end) = va.checked_add(offset).and_then(|a| a.checked_add(len.max(1))) else { return };
+    s.ensure_mapped(start, end - start, |t| query_tile_holes(t));
+    let raw = res as *mut c_void;
+    let Some(res_obj) = ID3D12Resource::from_raw_borrowed(&raw).cloned() else { return };
+    let mut to_map = Vec::new();
+    let existing = s.buffers.get(&res).cloned().unwrap_or_default();
+    for t in (start..end).step_by(TILE) {
+        if let Some(entry) = s.mapped.get(&t) {
+            if !existing.contains(&entry.pool) {
+                to_map.push((t, entry.pool));
+            }
+        }
+    }
+    if to_map.is_empty() {
+        return;
+    }
+    s.map_tiles(&res_obj, res_base, &to_map);
+    let buf_tiles = s.buffers.entry(res).or_default();
+    for &(_, tile) in &to_map {
+        *s.pinned.entry(tile).or_default() += 1;
+        buf_tiles.push(tile);
+    }
+    s.signal();
 }
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
