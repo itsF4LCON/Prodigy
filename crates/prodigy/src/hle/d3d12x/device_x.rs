@@ -674,6 +674,11 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // R9G9B9E5_SHAREDEXP (67): not one a PC driver takes as a render target or UAV
+    // (flags 0x5: E_INVALIDARG) – R11G11B10_FLOAT (26) is also 32-bit HDR RGB and supports both.
+    if format == 67 && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -715,6 +720,7 @@ fn depth_typeless(f: u32) -> Option<u32> {
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
+        67 => 26,
         f => pc_view_format(f),
     }
 }
@@ -737,6 +743,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // a target made R11G11B10_FLOAT (`pc_resource_desc`)
+        (26, 67) => 26,
         (_, v) => v,
     }
 }
@@ -1063,6 +1071,11 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
+        x[0x20] = 67; // R9G9B9E5_SHAREDEXP target/UAV -> R11G11B10_FLOAT (read-only stays 67)
+        x[0x30..0x34].copy_from_slice(&0x300005u32.to_le_bytes());
+        assert_eq!(desc(&x), (26, 0x5));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes());
+        assert_eq!(desc(&x), (67, 0));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);
@@ -1073,7 +1086,9 @@ mod tests {
         assert_eq!(pc_shader_view_format(19, 62), 22);
         assert_eq!(pc_shader_view_format(28, 86), 28);
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
-        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+        assert_eq!(pc_shader_view_format(26, 67), 26);
+        assert_eq!(pc_shader_view_format(67, 67), 67, "an R9G9B9E5_SHAREDEXP texture that stayed one");
+        assert_eq!((pc_target_format(86), pc_target_format(67), pc_target_format(118), pc_view_format(117)), (28, 26, 45, 10));
     }
 
     #[test]
