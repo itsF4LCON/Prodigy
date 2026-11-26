@@ -495,13 +495,17 @@ pub fn init() -> Result<String, String> {
         // `PRODIGY_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        if std::env::var_os("PRODIGY_DRED").is_some() {
+        if let Some(mode) = std::env::var_os("PRODIGY_DRED") {
+            let pagefault_only = mode.eq_ignore_ascii_case("pagefault");
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    if !pagefault_only {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    crate::xlog_info!("D3D12: DRED enabled ({})", if pagefault_only { "page fault only" } else { "auto-breadcrumbs + page fault" });
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
@@ -5369,9 +5373,43 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             mapped.push(l);
         }
     }
+    let isolate = super::bind::fault_isolate_secs().is_some_and(|s| {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_secs() >= s
+    });
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        if isolate {
+            let dev_raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&dev_raw);
+            let q = ID3D12CommandQueue::from_raw_borrowed(&this);
+            for &cl in chunk {
+                f(this, 1, &cl);
+                if let (Some(dev), Some(q)) = (dev, q) {
+                    if let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                        if q.Signal(&fence, 1).is_ok() {
+                            let t0 = std::time::Instant::now();
+                            while fence.GetCompletedValue() < 1 && t0.elapsed() < std::time::Duration::from_secs(3) {
+                                if dev.GetDeviceRemovedReason().is_err() {
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                    if let Err(e) = dev.GetDeviceRemovedReason() {
+                        let cmds = super::bind::dump_cmds(cl);
+                        crate::xlog_error!("FAULT ISOLATE: list {cl:p} on queue {this:p} triggered {:#x} ({} recorded cmds):", e.code().0 as u32, cmds.len());
+                        for (i, c) in cmds.iter().enumerate() {
+                            crate::xlog_error!("  [{i:03}] {c}");
+                        }
+                        stop_if_device_removed();
+                    }
+                }
+            }
+        } else {
+            f(this, chunk.len() as u32, chunk.as_ptr());
+        }
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
@@ -5450,20 +5488,25 @@ pub fn log_device_removed() {
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
-            let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
-                let mut v = Vec::new();
-                while !n.is_null() && v.len() < 8 {
-                    let a = &*n;
-                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
-                    v.push(format!("type {} {}", a.AllocationType.0, name));
-                    n = a.pNext;
-                }
-                v.join(", ")
-            };
-            let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+        match dred.GetPageFaultAllocationOutput() {
+            Ok(pf) => {
+                let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
+                    let mut v = Vec::new();
+                    while !n.is_null() && v.len() < 8 {
+                        let a = &*n;
+                        let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
+                        v.push(format!("type {} {}", a.AllocationType.0, name));
+                        n = a.pNext;
+                    }
+                    v.join(", ")
+                };
+                let va = pf.PageFaultVA;
+                let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            }
+            Err(e) => {
+                crate::xlog_error!("DRED page fault output unavailable: {e}");
+            }
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
             let mut n = bc.pHeadAutoBreadcrumbNode;
