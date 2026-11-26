@@ -241,16 +241,30 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// heap flags for pool heaps (NONE on Tier 2; ALLOW_ONLY_*_TEXTURES on Tier 1)
+    heap_flags: D3D12_HEAP_FLAGS,
 }
 
 // D3D12 objects are free-threaded
 unsafe impl Send for Pages {}
 
-/// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
-static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
+/// (device raw pointer, heap_flags) → its pages (None inside: tiled tier < 2 on this device)
+static PAGES: Mutex<std::collections::BTreeMap<(usize, i32), Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn page_heap_flags(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> D3D12_HEAP_FLAGS {
+    if tier2(dev) {
+        return D3D12_HEAP_FLAG_NONE;
+    }
+    let rt_ds = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0;
+    if desc.Flags.0 & rt_ds != 0 {
+        D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES
+    } else {
+        D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+    }
+}
 
 impl Pages {
-    unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
+    unsafe fn new(dev: &ID3D12Device, heap_flags: D3D12_HEAP_FLAGS) -> Option<Pages> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
         dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).ok()?;
         // tier 2: unmapped tiles read as zero, writes to them go nowhere
@@ -273,6 +287,7 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            heap_flags,
         })
     }
 
@@ -293,12 +308,23 @@ impl Pages {
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             // every kind of texture (resource heap tier 2: the only flags for both)
-            Flags: D3D12_HEAP_FLAG_NONE,
+            Flags: self.heap_flags,
         };
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-            crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
-            return None;
+            let l0_desc = D3D12_HEAP_DESC {
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                },
+                ..desc
+            };
+            if let Err(e2) = super::title_textures::own_work(|| dev.CreateHeap(&l0_desc, &mut heap)) {
+                crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e}; L0: {e2})");
+                return None;
+            }
         }
         self.pools.push(heap?);
         let h = self.pools.len() as u32 - 1;
@@ -536,8 +562,9 @@ unsafe fn place_on_pages(
         log("no tiled support for its format or sample count");
         return None;
     }
+    let heap_flags = page_heap_flags(dev, &tiled);
     let mut g = PAGES.lock().unwrap();
-    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
+    let pages = g.entry((dev.as_raw() as usize, heap_flags.0)).or_insert_with(|| Pages::new(dev, heap_flags)).as_mut()?;
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         log(&format!("{hr:#x}"));
@@ -588,23 +615,30 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     }
     let Some(dev) = dev else { return false };
     let key = res.as_raw() as usize;
+    let dev_key = dev.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
-        return false;
-    };
-    if mapped {
+    for (&(d, _), entry) in g.iter_mut() {
+        if d != dev_key {
+            continue;
+        }
+        let Some(pages) = entry.as_mut() else { continue };
+        let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+            continue;
+        };
+        if mapped {
+            return true;
+        }
+        let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+            return false;
+        };
+        if let Some(t) = pages.targets.get_mut(&key) {
+            t.used = used;
+            t.used_extra = used_extra;
+            t.mapped = true;
+        }
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
-        return false;
-    };
-    if let Some(t) = pages.targets.get_mut(&key) {
-        t.used = used;
-        t.used_extra = used_extra;
-        t.mapped = true;
-    }
-    true
+    false
 }
 
 /// A resource released: its pages are no longer its.
@@ -627,12 +661,18 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         return;
     }
     let Some(dev) = dev else { return };
+    let dev_key = dev.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let key = queue.as_raw() as usize;
-    if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-        let _ = queue.Wait(&pages.fence, pages.value);
-        pages.waited.insert(key, pages.value);
+    for (&(d, _), entry) in g.iter_mut() {
+        if d != dev_key {
+            continue;
+        }
+        let Some(pages) = entry.as_mut() else { continue };
+        if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+            let _ = queue.Wait(&pages.fence, pages.value);
+            pages.waited.insert(key, pages.value);
+        }
     }
 }
 
@@ -642,8 +682,9 @@ pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    g.iter().filter(|(&(d, _), _)| d == device).filter_map(|(_, p)| p.as_ref()).fold((0, 0), |(used, pools), p| {
+        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+    })
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `PRODIGY_ACTIVITY`
@@ -675,7 +716,7 @@ pub unsafe fn place_pages(
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    if !tier2(dev) || std::env::var_os("PRODIGY_VRAM_ARENAS").is_some() {
+    if std::env::var_os("PRODIGY_VRAM_ARENAS").is_some() {
         return None;
     }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
@@ -687,13 +728,13 @@ pub unsafe fn place_pages(
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    if !tier2(dev) {
-        return None;
-    }
     if std::env::var_os("PRODIGY_VRAM_ARENAS").is_none() {
         if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, riid, ppv) {
             return Some(hr);
         }
+    }
+    if !tier2(dev) {
+        return None;
     }
     let info = dev.GetResourceAllocationInfo(0, &[*desc]);
     if info.SizeInBytes == u64::MAX || info.SizeInBytes == 0 || va as u64 % info.Alignment.max(1) != 0 {
