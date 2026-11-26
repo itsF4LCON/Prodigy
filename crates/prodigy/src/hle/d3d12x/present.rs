@@ -94,6 +94,10 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     if res == 0 {
         return;
     }
+    let overlay = (plane_count >= 2)
+        .then(|| plane_resource(planes, 1))
+        .flatten()
+        .filter(|&r| r != res);
     {
         let mut p = PRESENTED.lock().unwrap();
         if !p.contains(&res) {
@@ -125,7 +129,22 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    present_now(Duration::ZERO, Some((queue as usize, res, overlay)));
+}
+
+/// Reads the first `ID3D12Resource*` from `D3D12XBOX_PRESENT_PLANE_PARAMETERS[index]` (0x48-byte stride).
+unsafe fn plane_resource(planes: *const u8, index: u32) -> Option<usize> {
+    let plane = planes.add(index as usize * 0x48);
+    if !crate::gpu::shader::readable(plane as usize, 0x18) {
+        return None;
+    }
+    let count = (plane.add(8) as *const u32).read_unaligned();
+    let list = (plane.add(0x10) as *const usize).read_unaligned();
+    if count == 0 || !crate::gpu::shader::readable(list, 8) {
+        return None;
+    }
+    let res = (list as *const usize).read_unaligned();
+    (res != 0).then_some(res)
 }
 
 thread_local! {
@@ -530,6 +549,8 @@ struct Presenter {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
+    overlay_source: Option<ID3D12Resource>,
+    overlay: Option<OverlayCompositor>,
     dumps: Vec<FrameDump>,
     disabled: bool,
     value: u64,
@@ -574,9 +595,125 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_source: None, overlay_source: None, overlay: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
+}
+
+struct OverlayCompositor {
+    fmt: DXGI_FORMAT,
+    rs: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    srv_heap: ID3D12DescriptorHeap,
+    rtv_heap: ID3D12DescriptorHeap,
+}
+
+unsafe fn ensure_overlay(p: &mut Presenter, fmt: DXGI_FORMAT) -> bool {
+    if p.overlay.as_ref().is_some_and(|o| o.fmt == fmt) {
+        return true;
+    }
+    const HLSL: &str = r#"
+Texture2D<float4> tex0 : register(t0);
+SamplerState samp0 : register(s0);
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+float4 PSMain(VSOut i) : SV_TARGET {
+    return tex0.SampleLevel(samp0, i.uv, 0.0);
+}
+"#;
+    let Ok((vs, _)) = crate::gpu::recomp::dxc::compile_cached(HLSL, "VSMain", "vs_6_0") else { return false };
+    let Ok((ps, _)) = crate::gpu::recomp::dxc::compile_cached(HLSL, "PSMain", "ps_6_0") else { return false };
+    let range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let param = D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxLOD: f32::MAX,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        ..Default::default()
+    };
+    let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: 1,
+        pParameters: &param,
+        NumStaticSamplers: 1,
+        pStaticSamplers: &sampler,
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut blob = None;
+    if D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).is_err() {
+        return false;
+    }
+    let Some(blob) = blob else { return false };
+    let rs_bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+    let Ok(rs) = p.dev.CreateRootSignature::<ID3D12RootSignature>(0, rs_bytes) else { return false };
+
+    let mut blend = D3D12_BLEND_DESC::default();
+    blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        SrcBlend: D3D12_BLEND_ONE,
+        DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+        BlendOp: D3D12_BLEND_OP_ADD,
+        SrcBlendAlpha: D3D12_BLEND_ONE,
+        DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+        BlendOpAlpha: D3D12_BLEND_OP_ADD,
+        RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+        ..Default::default()
+    };
+    let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+        VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as *const c_void, BytecodeLength: vs.len() },
+        PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as *const c_void, BytecodeLength: ps.len() },
+        BlendState: blend,
+        SampleMask: u32::MAX,
+        RasterizerState: D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            ..Default::default()
+        },
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    pso_desc.RTVFormats[0] = fmt;
+    let pso_res = p.dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&pso_desc);
+    std::mem::ManuallyDrop::into_inner(pso_desc.pRootSignature);
+    let Ok(pso) = pso_res else { return false };
+
+    let Ok(srv_heap) = p.dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        NumDescriptors: 1,
+        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+        NodeMask: 0,
+    }) else { return false };
+    let Ok(rtv_heap) = p.dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        NumDescriptors: 1,
+        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        NodeMask: 0,
+    }) else { return false };
+    p.overlay = Some(OverlayCompositor { fmt, rs, pso, srv_heap, rtv_heap });
+    true
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
@@ -625,7 +762,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize, Option<usize>)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -636,10 +773,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let _reset = Reset;
-    let (queue, src, mut guard) = if let Some((queue, res)) = frame {
+    let (queue, src, overlay_res, mut guard) = if let Some((queue, res, ov)) = frame {
         let raw = res as *mut c_void;
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), PRESENTER.lock().unwrap())
+        let ov_src = ov.and_then(|o| {
+            let r = o as *mut c_void;
+            ID3D12Resource::from_raw_borrowed(&r).cloned()
+        });
+        (queue, src.clone(), ov_src, PRESENTER.lock().unwrap())
     } else {
         let Ok(guard) = PRESENTER.try_lock() else { return };
         if PRESENTX.load(Ordering::Relaxed) {
@@ -649,7 +790,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         let Some((queue, res)) = *candidate else { return };
         let raw = res as *mut c_void;
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), guard)
+        (queue, src.clone(), None, guard)
     };
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
@@ -683,6 +824,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     p.copy_source = None;
+    p.overlay_source = None;
     p.dumps.clear();
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
@@ -725,8 +867,56 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-    p.list.ResourceBarrier(&b2);
+    let ov = overlay_res.as_ref().and_then(|r| {
+        let d = backbuffer_like(r.as_raw() as usize)?;
+        ensure_overlay(p, fmt).then_some((r, d))
+    });
+    if let Some((ov_src, ov_desc)) = ov {
+        let b2 = [
+            transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            transition(ov_src, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        ];
+        p.list.ResourceBarrier(&b2);
+        let ov_comp = p.overlay.as_ref().unwrap();
+        let srv_fmt = swap_format(ov_desc.Format).unwrap_or(ov_desc.Format);
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_fmt,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        };
+        let srv_cpu = ov_comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        let srv_gpu = ov_comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
+        let rtv_cpu = ov_comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        p.dev.CreateShaderResourceView(ov_src, Some(&srv_desc), srv_cpu);
+        let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        p.dev.CreateRenderTargetView(&bb, Some(&rtv_desc), rtv_cpu);
+        p.list.OMSetRenderTargets(1, Some(&rtv_cpu), false, None);
+        let vp = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: p.w as f32, Height: p.h as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let sc_rect = RECT { left: 0, top: 0, right: p.w as i32, bottom: p.h as i32 };
+        p.list.RSSetViewports(&[vp]);
+        p.list.RSSetScissorRects(&[sc_rect]);
+        p.list.SetDescriptorHeaps(&[Some(ov_comp.srv_heap.clone())]);
+        p.list.SetGraphicsRootSignature(&ov_comp.rs);
+        p.list.SetPipelineState(&ov_comp.pso);
+        p.list.SetGraphicsRootDescriptorTable(0, srv_gpu);
+        p.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        p.list.DrawInstanced(3, 1, 0, 0);
+        let b3 = [
+            transition(ov_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT),
+            transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
+        ];
+        p.list.ResourceBarrier(&b3);
+    } else {
+        let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+        p.list.ResourceBarrier(&b2);
+    }
     if p.list.Close().is_err() {
         return;
     }
@@ -735,6 +925,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
+    p.overlay_source = overlay_res;
     p.dumps = dumps;
     p.value += 1;
     if let Err(e) = q.Signal(&p.fence, p.value) {
