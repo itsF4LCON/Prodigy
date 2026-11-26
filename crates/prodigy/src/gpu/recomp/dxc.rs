@@ -518,7 +518,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
         let opt = if let Ok(v) = std::env::var("PRODIGY_DXC_OPT") {
             let v = v.trim();
             if v.starts_with("-O") { Some(v.to_string()) } else { None }
-        } else if src.len() > 2 * 1024 * 1024 {
+        } else if src.len() > 8 * 1024 * 1024 {
             Some("-O0".to_string())
         } else if src.len() > 256 * 1024 {
             Some("-O1".to_string())

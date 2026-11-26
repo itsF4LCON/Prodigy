@@ -558,13 +558,53 @@ fn resolve_wait_entry(p: Arc<Pending>, pso: usize, budget: Option<std::time::Dur
     }
 }
 
-/// How long a bind waits for a pipeline still being built (`PRODIGY_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
+/// How long a bind waits for a pipeline still being built (`PRODIGY_PSO_WAIT_MS`; default 200 ms;
+/// `0` = wait until it is built). A retail game builds compute programs on its own threads: the
+/// driver takes up to 30 s for the biggest translated ones, and the title's watchdog ends it when
+/// its main thread has been held 30 s.
 fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("PRODIGY_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+    *B.get_or_init(|| {
+        let ms = match std::env::var("PRODIGY_PSO_WAIT_MS") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(200),
+            Err(_) => 200,
+        };
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
+/// Rolling wait-time cap across all binds: at most 2000 ms of actual wait time in any 4 s window
+/// so fast/cached compute pipelines (2–80 ms) finish synchronously without skipping dispatches,
+/// while a burst of multi-second uncached compiles can never approach a title's 30 s watchdog.
+static WAIT_WINDOW: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+
+fn rolling_wait_remaining(budget: std::time::Duration) -> Option<std::time::Duration> {
+    if cfg!(test) {
+        return Some(budget);
+    }
+    let now = std::time::Instant::now();
+    let mut g = WAIT_WINDOW.lock().unwrap();
+    let (start, spent) = g.get_or_insert((now, 0));
+    if now.duration_since(*start) >= std::time::Duration::from_secs(4) {
+        *start = now;
+        *spent = 0;
+    }
+    let rem = 2000u64.saturating_sub(*spent);
+    (rem > 0).then(|| budget.min(std::time::Duration::from_millis(rem)))
+}
+
+fn rolling_wait_record(elapsed: std::time::Duration) {
+    if cfg!(test) {
+        return;
+    }
+    let ms = elapsed.as_millis() as u64;
+    if ms == 0 {
+        return;
+    }
+    let mut g = WAIT_WINDOW.lock().unwrap();
+    if let Some((_, spent)) = g.as_mut() {
+        *spent = spent.saturating_add(ms);
+    }
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
@@ -585,11 +625,16 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return pso;
     }
     p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
-        return built(p);
+    if let Some(wait) = rolling_wait_remaining(budget) {
+        let t0 = std::time::Instant::now();
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait, |d| !*d).unwrap();
+        let finished = *done;
+        drop(done);
+        rolling_wait_record(t0.elapsed());
+        if finished {
+            return built(p);
+        }
     }
-    drop(done);
     p.late.store(true, Ordering::Release);
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);

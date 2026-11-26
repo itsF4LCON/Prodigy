@@ -1148,10 +1148,11 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     slots.into_iter().map(|m| m.into_inner().unwrap()).collect()
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
+/// The title's bytes at `at`: zero-copy when inside the permanently committed coherent window,
+/// else copied safely via `read_committed` (`ReadProcessMemory`) so concurrent page unmaps on
+/// title streaming pools cannot fault `detile_level`.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
