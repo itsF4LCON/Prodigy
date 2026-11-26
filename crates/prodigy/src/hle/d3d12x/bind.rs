@@ -34,6 +34,30 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// recent commands recorded on this list (only populated when `PRODIGY_FAULT_ISOLATE` is set)
+    cmds: Vec<String>,
+}
+
+pub(super) fn fault_isolate_secs() -> Option<u64> {
+    static VAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| std::env::var("PRODIGY_FAULT_ISOLATE").ok().and_then(|s| s.parse().ok()))
+}
+
+pub(super) fn note_cmd(list: *mut c_void, f: impl FnOnce() -> String) {
+    if fault_isolate_secs().is_none() {
+        return;
+    }
+    let msg = f();
+    with(list, |s| {
+        if s.cmds.len() >= 128 {
+            s.cmds.remove(0);
+        }
+        s.cmds.push(msg);
+    });
+}
+
+pub(super) fn dump_cmds(list: *mut c_void) -> Vec<String> {
+    with(list, |s| s.cmds.clone())
 }
 
 const STATE_SHARDS: usize = 32;
@@ -89,6 +113,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.cmds.clear();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -281,6 +306,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        note_cmd(this, || format!("ExecuteIndirect(untranslated pso={pso:#x} max={max} args={args:#x}+{args_off:#x} cnt={count_buf:#x}+{count_off:#x})"));
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if is_root_changing_signature(sig) {
@@ -293,6 +319,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            note_cmd(this, || format!("ExecuteIndirect(translated gfx={gfx} pso={pso:#x} max={max} args={args:#x}+{args_off:#x} cnt={count_buf:#x}+{count_off:#x})"));
             count(if gfx { DRAWS } else { DISPATCHES });
             pc(this, sig, max, args, args_off, count_buf, count_off)
         }
@@ -379,6 +406,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
+        note_cmd(this, || format!("DrawInstanced(pso={:#x} v={vertices} inst={instances} fv={first_vertex})", super::pso_async::resolve(with(this, |s| s.pso))));
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
         }
@@ -395,6 +423,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        note_cmd(this, || format!("DrawIndexedInstanced(pso={:#x} idx={indices} inst={instances} fi={first_index} bv={base_vertex})", super::pso_async::resolve(with(this, |s| s.pso))));
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
@@ -439,6 +468,7 @@ pub(super) unsafe fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     let pso = with(this, |s| s.pso);
     let real = super::pso_async::resolve_wait(pso);
     if let Some(tp) = super::real::two_pass_of(real) {
+        note_cmd(this, || format!("DispatchMesh(two_pass emu={} pso={real:#x} [{x},{y},{z}])", tp.emulated_vs));
         match translated_dispatch_mesh(this, real, &tp, x, y, z) {
             Ok(()) => count(DRAWS),
             Err(e) => {
@@ -940,7 +970,10 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            note_cmd(this, || format!("Dispatch(pso={pso:#x} [{x},{y},{z}])"));
+            count(DISPATCHES);
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

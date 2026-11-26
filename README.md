@@ -7,16 +7,9 @@
 
 ## Compatibility
 
-> [!NOTE]
-> Game compatibility has **not yet been directly tested** on Prodigy's recent changes. The statuses below reflect upstream reports from [XCL](https://github.com/ivall/xcl) and [VIctory](https://github.com/Marvisak/VIctory).
-
-| Game | Upstream Status | Notes |
+| Game | Status | Notes |
 | :--- | :---: | :--- |
-| **Minecraft Preview** | ⏳ | Untested here (playable upstream in XCL) |
-| **Unicorn Overlord** | ⏳ | Untested here (playable upstream in XCL) |
-| **Fortnite** | ⏳ | Untested here (boots & runs offline upstream in XCL) |
-| **XDefiant** | ⏳ | Untested here (boots & runs offline upstream in XCL) |
-| **Unannounced Retail Title** | ⏳ | Untested here (menus at 30 FPS & enters 3D world upstream in XCL / VIctory) |
+| **Unannounced Retail Title** | 🟡 | Boots to Account Picker, intro, loading screens, and Opus audio (tested on GTX 1060 6GB; hits VRAM OOM during 3D resource loading on 6 GB) |
 
 ## Highlights
 
