@@ -322,6 +322,22 @@ impl Pages {
                 ..desc
             };
             if let Err(e2) = super::title_textures::own_work(|| dev.CreateHeap(&l0_desc, &mut heap)) {
+                // Under GPU memory pressure, reclaim any idle/cooling tiles immediately instead of OOMing.
+                let now = std::time::Instant::now();
+                while let Some((key, since)) = self.idle.pop_front() {
+                    let still_idle = |p: &Page| p.idle_since == Some(since);
+                    let page = match key {
+                        PageKey::Own(a) if self.pages.get(&a).is_some_and(still_idle) => self.pages.remove(&a),
+                        PageKey::Extra(va, i) if self.extra_pages.get(&(va, i)).is_some_and(still_idle) => self.extra_pages.remove(&(va, i)),
+                        _ => None,
+                    };
+                    if let Some(p) = page {
+                        self.cooling.push_back((p.tile, now));
+                    }
+                }
+                if let Some((t, _)) = self.cooling.pop_front() {
+                    return Some(t);
+                }
                 crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e}; L0: {e2})");
                 return None;
             }
