@@ -1320,9 +1320,9 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
-/// page at each address (page 0: the address is unmapped)
+/// page at each address (`pages` null or entry 0: the address is unmapped)
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -1332,7 +1332,10 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    let ok = (0..n).all(|i| {
+        let page = if pages.is_null() { std::ptr::null_mut() } else { pages.add(i) as *mut usize };
+        !map_pages(away, *addresses.add(i), 1, page).is_null()
+    });
     give_back_homes(away);
     ok as BOOL
 }
@@ -2386,6 +2389,7 @@ mod tests {
             let mut none = [0u64, 0];
             let both = [s, t];
             assert_eq!(XMemMapPhysicalPagesScatter(both.as_ptr(), 2, none.as_mut_ptr()), 1);
+            assert_eq!(XMemMapPhysicalPagesScatter(both.as_ptr(), 2, std::ptr::null_mut()), 1);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
