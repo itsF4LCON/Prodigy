@@ -121,6 +121,7 @@ pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
+        forget_small(resource);
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
         }
@@ -563,6 +564,7 @@ unsafe fn place_on_pages(
     if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
         return None;
     }
+    let va = super::title_textures::mirror_source(va);
     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
@@ -718,8 +720,9 @@ fn tier2(dev: &ID3D12Device) -> bool {
 }
 
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
-/// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
-/// available (the caller falls back to a committed resource).
+/// the console) backed by shared 64 KiB video-memory pages (or 4 KiB-aligned suballocated heaps for
+/// small `< 64 KiB` textures); None when placement is not available (the caller falls back to a
+/// committed resource).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn place_pages(
     this: *mut c_void,
@@ -732,10 +735,148 @@ pub unsafe fn place_pages(
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    if let Some(hr) = place_small(dev, this, desc, state, clear, riid, ppv) {
+        return Some(hr);
+    }
     if std::env::var_os("PRODIGY_VRAM_ARENAS").is_some() {
         return None;
     }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
+}
+
+const SMALL_BLOCK: usize = 4096;
+const SMALL_HEAP_BYTES: usize = 16 << 20;
+
+struct SmallPool {
+    heaps: Vec<(ID3D12Heap, usize)>,
+    free: [Vec<(usize, usize)>; 16],
+    cooling: std::collections::VecDeque<((usize, usize, usize), std::time::Instant)>,
+}
+
+unsafe impl Send for SmallPool {}
+
+impl SmallPool {
+    fn new() -> Self {
+        Self {
+            heaps: Vec::new(),
+            free: std::array::from_fn(|_| Vec::new()),
+            cooling: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn drain_cooling(&mut self, force: bool) {
+        while let Some(&((h, off, blocks), at)) = self.cooling.front() {
+            if !force && at.elapsed() < COOL {
+                break;
+            }
+            self.cooling.pop_front();
+            if blocks < self.free.len() {
+                self.free[blocks].push((h, off));
+            }
+        }
+    }
+
+    unsafe fn alloc(&mut self, dev: &ID3D12Device, blocks: usize) -> Option<(usize, usize)> {
+        self.drain_cooling(false);
+        if let Some(slot) = self.free[blocks].pop() {
+            return Some(slot);
+        }
+        let bytes = blocks * SMALL_BLOCK;
+        if let Some((idx, (_, cursor))) = self.heaps.iter_mut().enumerate().rev().find(|(_, (_, c))| *c + bytes <= SMALL_HEAP_BYTES) {
+            let off = *cursor;
+            *cursor += bytes;
+            return Some((idx, off));
+        }
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: SMALL_HEAP_BYTES as u64,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        if super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)).is_err() {
+            let l0 = D3D12_HEAP_DESC {
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                },
+                ..desc
+            };
+            if super::title_textures::own_work(|| dev.CreateHeap(&l0, &mut heap)).is_err() {
+                self.drain_cooling(true);
+                return self.free[blocks].pop();
+            }
+        }
+        let idx = self.heaps.len();
+        self.heaps.push((heap?, bytes));
+        Some((idx, 0))
+    }
+}
+
+static SMALL_POOLS: Mutex<std::collections::BTreeMap<usize, SmallPool>> = Mutex::new(std::collections::BTreeMap::new());
+static SMALL_OF: Mutex<Option<std::collections::HashMap<usize, (usize, usize, usize, usize)>>> = Mutex::new(None);
+
+fn forget_small(resource: usize) {
+    let Some((dev_key, h, off, blocks)) = SMALL_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) else {
+        return;
+    };
+    if let Some(pool) = SMALL_POOLS.lock().unwrap().get_mut(&dev_key) {
+        pool.cooling.push_back(((h, off, blocks), std::time::Instant::now()));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn place_small(
+    dev: &ID3D12Device,
+    this: *mut c_void,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN
+        || desc.SampleDesc.Count != 1
+        || desc.Flags.0 != 0
+    {
+        return None;
+    }
+    let small_desc = D3D12_RESOURCE_DESC { Alignment: SMALL_BLOCK as u64, ..*desc };
+    let info = dev.GetResourceAllocationInfo(0, &[small_desc]);
+    if info.Alignment != SMALL_BLOCK as u64 || info.SizeInBytes == 0 || info.SizeInBytes >= PAGE as u64 {
+        return None;
+    }
+    let blocks = (info.SizeInBytes as usize).div_ceil(SMALL_BLOCK);
+    if blocks == 0 || blocks >= 16 {
+        return None;
+    }
+    let dev_key = dev.as_raw() as usize;
+    let (heap_raw, h, off) = {
+        let mut pools = SMALL_POOLS.lock().unwrap();
+        let pool = pools.entry(dev_key).or_insert_with(SmallPool::new);
+        let (h, off) = pool.alloc(dev, blocks)?;
+        (pool.heaps[h].0.as_raw() as usize, h, off)
+    };
+    let hr = super::real::dev_create_placed_resource(this, heap_raw, off, &small_desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    if hr < 0 || (*ppv).is_null() {
+        if let Some(pool) = SMALL_POOLS.lock().unwrap().get_mut(&dev_key) {
+            pool.free[blocks].push((h, off));
+        }
+        return None;
+    }
+    let raw = *ppv as usize;
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw);
+    SMALL_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(raw, (dev_key, h, off, blocks));
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+        let heaps = SMALL_POOLS.lock().unwrap().get(&dev_key).map_or(0, |p| p.heaps.len());
+        crate::xlog_info!("D3D12.X: small 4 KiB texture pool: {n} placements in {} MiB", heaps * (SMALL_HEAP_BYTES >> 20));
+    }
+    Some(hr)
 }
 
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its

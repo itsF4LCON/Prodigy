@@ -32,8 +32,8 @@ use windows_sys::Win32::System::Memory::{
 };
 
 const TILE: usize = 0x1_0000;
-/// tiles of a video-memory pool heap (64 MiB)
-const POOL_TILES: u32 = 1024;
+/// tiles of a video-memory pool heap (16 MiB: finer-grained retirement on low-VRAM GPUs)
+const POOL_TILES: u32 = 256;
 /// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
