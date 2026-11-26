@@ -217,6 +217,8 @@ struct Target {
     console_bytes: Option<u64>,
     total: u32,
     mapped: bool,
+    gpu_owned: bool,
+    seq: u64,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
 }
@@ -227,6 +229,7 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    next_seq: u64,
     pools: Vec<ID3D12Heap>,
     free: Vec<Tile>,
     /// tiles given back, reusable after `COOL`
@@ -280,6 +283,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            next_seq: 1,
             pools: Vec::new(),
             free: Vec::new(),
             cooling: std::collections::VecDeque::new(),
@@ -297,7 +301,7 @@ impl Pages {
         sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.cooling, now);
     }
 
-    unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
+    unsafe fn take_tile(&mut self, dev: &ID3D12Device, exclude: usize) -> Option<Tile> {
         if let Some(t) = self.free.pop() {
             return Some(t);
         }
@@ -338,6 +342,34 @@ impl Pages {
                 }
                 if let Some((t, _)) = self.cooling.pop_front() {
                     return Some(t);
+                }
+                // Still out of GPU memory: LRU-evict oldest mapped sampled textures until a tile
+                // becomes free so streaming stays within the WDDM GPU memory ceiling instead of OOMing.
+                while let Some(&victim_key) = self
+                    .targets
+                    .iter()
+                    .filter(|(&k, t)| k != exclude && t.mapped && !t.gpu_owned && (!t.used.is_empty() || !t.used_extra.is_empty()))
+                    .min_by_key(|(_, t)| t.seq)
+                    .map(|(k, _)| k)
+                {
+                    let (total, used, used_extra) = {
+                        let t = self.targets.get_mut(&victim_key).unwrap();
+                        t.mapped = false;
+                        (t.total, std::mem::take(&mut t.used), std::mem::take(&mut t.used_extra))
+                    };
+                    let raw = victim_key as *mut c_void;
+                    if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                        self.unmap(res, total);
+                    }
+                    self.release_tiles(used, used_extra, now, true);
+                    static EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 64) {
+                        crate::xlog_info!("D3D12.X: VRAM pressure: LRU-evicted {n} sampled tiled texture(s) to stay within GPU memory");
+                    }
+                    if let Some((t, _)) = self.cooling.pop_front() {
+                        return Some(t);
+                    }
                 }
                 crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e}; L0: {e2})");
                 return None;
@@ -441,6 +473,7 @@ impl Pages {
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
+        let exclude = res.as_raw() as usize;
         for i in 0..total as usize {
             let tile = if i < own {
                 let a = first + i * PAGE;
@@ -450,7 +483,7 @@ impl Pages {
                         p.idle_since = None;
                         Some(p.tile)
                     }
-                    None => self.take_tile(dev).inspect(|&t| {
+                    None => self.take_tile(dev, exclude).inspect(|&t| {
                         self.pages.insert(a, Page { tile: t, users: 1, idle_since: None });
                     }),
                 };
@@ -466,7 +499,7 @@ impl Pages {
                         p.idle_since = None;
                         Some(p.tile)
                     }
-                    None => self.take_tile(dev).inspect(|&t| {
+                    None => self.take_tile(dev, exclude).inspect(|&t| {
                         self.extra_pages.insert(k, Page { tile: t, users: 1, idle_since: None });
                     }),
                 };
@@ -598,7 +631,9 @@ unsafe fn place_on_pages(
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
+    let seq = pages.next_seq;
+    pages.next_seq = pages.next_seq.wrapping_add(1);
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, gpu_owned: require_aligned, seq, used, used_extra });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
