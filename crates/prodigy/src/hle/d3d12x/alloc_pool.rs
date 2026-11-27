@@ -162,7 +162,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (made, free_backings): (Vec<usize>, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         s.types.remove(&alloc);
@@ -170,6 +170,7 @@ pub unsafe fn forget(alloc: usize) {
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
         let mut made = Vec::new();
+        let mut free_backings = Vec::new();
         for b in mine {
             let free = s.backings.get(&b).is_none_or(|x| x.free());
             if let Some(gone) = s.backings.remove(&b) {
@@ -177,22 +178,29 @@ pub unsafe fn forget(alloc: usize) {
                     s.of_list.remove(&l);
                 }
             }
-            if b != alloc && free {
-                made.push(b);
+            if free {
+                free_backings.push(b);
+                if b != alloc {
+                    made.push(b);
+                }
             }
         }
-        made
+        (made, free_backings)
     };
     // (outside the lock: their Release comes back here)
+    for b in free_backings {
+        super::console_list::allocator_reset(b as *mut c_void);
+    }
     for b in made {
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
 }
 
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
-/// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
-/// aside with its recordings and another one took its place.
-pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+/// recording on it, or this is off). `Some((hr, reset_backing))`: done here – `reset_backing`
+/// is the PC allocator that was actually reset (so its UMA blocks are safe to free), or `None`
+/// when the busy PC allocator was put aside and a fresh one was created instead.
+pub unsafe fn title_reset(alloc: *mut c_void) -> Option<(HRESULT, Option<usize>)> {
     if !enabled() {
         return None;
     }
@@ -202,7 +210,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
-unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
+unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<(HRESULT, Option<usize>)> {
     let a = alloc as usize;
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
@@ -212,23 +220,24 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
         if c == a {
             return None;
         }
-        return Some(reset(c as *mut c_void));
+        let hr = reset(c as *mut c_void);
+        return Some((hr, (hr >= 0).then_some(c)));
     }
     let ty = *s.types.get(&a)?;
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
-    let next = match reuse {
+    let (next, reset_backing) = match reuse {
         Some(f) => {
             // Keep ownership until Reset succeeds so a failure can be retried.
             let hr = reset(f as *mut c_void);
             if hr < 0 {
-                return Some(hr);
+                return Some((hr, None));
             }
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
             }
-            f
+            (f, Some(f))
         }
         None => {
             let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
@@ -241,7 +250,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
                 super::real::adopt(raw, super::real::Kind::CommandAllocator);
             }
             s.made += 1;
-            raw as usize
+            (raw as usize, None)
         }
     };
     s.aside.entry(a).or_default().push(c);
@@ -255,7 +264,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
             s.made
         );
     }
-    Some(0)
+    Some((0, reset_backing))
 }
 
 #[cfg(test)]
@@ -279,7 +288,7 @@ mod tests {
                     crate::util::E_FAIL
                 })
             };
-            assert_eq!(hr, Some(crate::util::E_FAIL));
+            assert_eq!(hr, Some((crate::util::E_FAIL, None)));
             assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
             assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
             assert_eq!(s.of_list.get(&list), Some(&alloc));
@@ -293,7 +302,7 @@ mod tests {
                 0
             })
         };
-        assert_eq!(hr, Some(0));
+        assert_eq!(hr, Some((0, Some(spare))));
         assert_eq!(calls, vec![spare; 3], "all attempts used the same spare without creating another");
         assert_eq!(s.cur.get(&alloc), Some(&spare));
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");

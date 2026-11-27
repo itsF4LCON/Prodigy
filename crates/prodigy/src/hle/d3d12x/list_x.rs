@@ -76,6 +76,25 @@ fn wait_timeout() -> Duration {
     })
 }
 
+fn gpu_wait_watchdog_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("PRODIGY_GPU_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| {
+                let vram_mb = real::adapter_vram_mb();
+                if (1..=6144).contains(&vram_mb) {
+                    Duration::from_secs(4)
+                } else {
+                    GPU_WAIT_WATCHDOG_TIMEOUT
+                }
+            })
+    })
+}
+
 fn once(counter: &AtomicU64, n: u64) -> bool {
     counter.fetch_add(1, Ordering::Relaxed) < n
 }
@@ -1395,8 +1414,9 @@ fn wake_sync_watchdog() {
                         let mut waiter_q = 0usize;
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
+                        let watchdog_timeout = gpu_wait_watchdog_timeout();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if aw.armed_at.elapsed() >= watchdog_timeout {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1446,7 +1466,7 @@ fn wake_sync_watchdog() {
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog_timeout().as_millis()
                 );
             }
             if had_expired {
@@ -1958,6 +1978,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    super::bind::mark_gpu_work(this);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
@@ -2260,6 +2281,9 @@ pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size:
 /// Values written by the GPU at `va` (WriteBufferImmediate: MARKER_IN = when the command is
 /// reached, MARKER_OUT = when the work before it is done).
 unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+        super::bind::mark_gpu_work(list);
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = 4 * words.len() as u64;
     if !va.is_multiple_of(n) {
@@ -3612,7 +3636,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
+    super::bind::reset(this, super::alloc_pool::current(alloc), pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
@@ -3767,12 +3791,52 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
-    if super::present::trace_frame() {
-        if let Some(a) = real::title_address(dst) {
-            note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
+    super::bind::mark_gpu_work(this);
+    let dst_delta = real::buffer_delta(dst);
+    let src_delta = real::buffer_delta(src);
+    if n > 0 {
+        if let Some((va, _)) = real::console_buffer(dst) {
+            super::sparse::ensure_buffer_range_mapped(dst, va, dst_off as usize, n as usize);
+        }
+        if let Some((va, _)) = real::console_buffer(src) {
+            super::sparse::ensure_buffer_range_mapped(src, va, src_off as usize, n as usize);
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+    let dst_pc = dst_off.saturating_add(dst_delta);
+    let src_pc = src_off.saturating_add(src_delta);
+    let dst_w = ID3D12Resource::from_raw_borrowed(&(dst as *mut c_void)).map(|r| r.GetDesc().Width);
+    let src_w = ID3D12Resource::from_raw_borrowed(&(src as *mut c_void)).map(|r| r.GetDesc().Width);
+    let mut len = n;
+    if let Some(dw) = dst_w {
+        if dst_pc.saturating_add(len) > dw {
+            static WARNED: AtomicU64 = AtomicU64::new(0);
+            let k = WARNED.fetch_add(1, Ordering::Relaxed);
+            if k < 8 || k.is_power_of_two() {
+                crate::xlog_warn!("CopyBufferRegion OOB dst #{k}: dst={dst:#x} off={dst_off:#x}+d={dst_delta:#x} len={len:#x} > width={dw:#x} (va={:?})", real::console_buffer(dst));
+            }
+            len = dw.saturating_sub(dst_pc);
+        }
+    }
+    if let Some(sw) = src_w {
+        if src_pc.saturating_add(len) > sw {
+            static WARNED: AtomicU64 = AtomicU64::new(0);
+            let k = WARNED.fetch_add(1, Ordering::Relaxed);
+            if k < 8 || k.is_power_of_two() {
+                crate::xlog_warn!("CopyBufferRegion OOB src #{k}: src={src:#x} off={src_off:#x}+d={src_delta:#x} len={len:#x} > width={sw:#x} (va={:?})", real::console_buffer(src));
+            }
+            len = sw.saturating_sub(src_pc);
+        }
+    }
+    super::bind::note_cmd(this, || format!("CopyBufferRegion(dst={dst:#x}+{dst_off:#x}(d={dst_delta:#x},w={dst_w:?}) src={src:#x}+{src_off:#x}(d={src_delta:#x},w={src_w:?}) n={len:#x})"));
+    if super::present::trace_frame() {
+        if let Some(a) = real::title_address(dst) {
+            note_gpu_write("CopyBufferRegion", a + dst_off as usize, len);
+        }
+    }
+    if len == 0 {
+        return;
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_pc, src, src_pc, len)
 }
 
 /// `PRODIGY_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -3801,6 +3865,12 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    super::bind::mark_gpu_work(this);
+    super::bind::note_cmd(this, || {
+        let dr: usize = dst.as_ref().map_or(0, |d| transmute_copy(&d.pResource));
+        let sr: usize = src.as_ref().map_or(0, |s| transmute_copy(&s.pResource));
+        format!("CopyTextureRegion(dst={dr:#x} ({x},{y},{z}) src={sr:#x})")
+    });
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
@@ -3926,12 +3996,16 @@ unsafe fn clear_uav_x(this: *mut c_void, pc_slot: usize, gpu: u64, cpu: u64, res
 /// command list #53 ClearUnorderedAccessViewUint (PC #49): translate console UMA descriptor
 /// handles to PC UAV handles (used by amd_fidelityfx_upscaler_xbox.dll / FSR4).
 pub(super) unsafe extern "system" fn clear_uav_uint_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, num_rects: u32, rects: *const c_void) {
+    super::bind::mark_gpu_work(this);
+    super::bind::note_cmd(this, || format!("ClearUavUint(res={res:#x} gpu={gpu:#x} rects={num_rects})"));
     clear_uav_x(this, PC_CLEAR_UAV_UINT, gpu, cpu, res, values, num_rects, rects);
 }
 
 /// command list #54 ClearUnorderedAccessViewFloat (PC #50): translate console UMA descriptor
 /// handles to PC UAV handles.
 pub(super) unsafe extern "system" fn clear_uav_float_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, num_rects: u32, rects: *const c_void) {
+    super::bind::mark_gpu_work(this);
+    super::bind::note_cmd(this, || format!("ClearUavFloat(res={res:#x} gpu={gpu:#x} rects={num_rects})"));
     clear_uav_x(this, PC_CLEAR_UAV_FLOAT, gpu, cpu, res, values, num_rects, rects);
 }
 
@@ -3965,6 +4039,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    super::bind::mark_gpu_work(this);
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
@@ -3974,6 +4049,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    super::bind::mark_gpu_work(this);
     super::present::note_use(dst, super::present::USE_COPY);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
@@ -3984,6 +4060,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    super::bind::mark_gpu_work(this);
+    super::bind::note_cmd(this, || format!("CopyResource(dst={dst:#x} src={src:#x})"));
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {

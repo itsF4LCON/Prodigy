@@ -3568,6 +3568,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    if super::present::trace_frame() || super::bind::fault_isolate_secs().is_some() || std::env::var_os("PRODIGY_SKIP_CS").is_some() {
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(cs), 0));
+    }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -3915,10 +3918,11 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-    if super::present::trace_frame() {
+    if super::present::trace_frame() || super::bind::fault_isolate_secs().is_some() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
-        // the input layout (semantic index, format, slot, offset) – what the vertices are read as
+        if super::present::trace_frame() {
+            // the input layout (semantic index, format, slot, offset) – what the vertices are read as
         let il = &d.InputLayout;
         let elems: Vec<String> = if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
             std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize)
@@ -3966,6 +3970,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
                     f(&z.BackFace)
                 );
             }
+        }
         }
     }
     if n < 5 || n % 1000 == 0 {
@@ -5183,15 +5188,25 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
-        None => reset_pc_allocator(this),
-    };
-    if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
+    match super::alloc_pool::title_reset(this) {
+        Some((hr, reset_backing)) => {
+            if hr >= 0 {
+                if let Some(b) = reset_backing {
+                    // Only free UMA blocks for the PC allocator that actually finished and reset;
+                    // a busy allocator put aside in `alloc_pool` is still being read by the GPU.
+                    super::console_list::allocator_reset(b as *mut c_void);
+                }
+            }
+            hr
+        }
+        None => {
+            let hr = reset_pc_allocator(this);
+            if hr >= 0 {
+                super::console_list::allocator_reset(this);
+            }
+            hr
+        }
     }
-    hr
 }
 
 // ---------------------------------------------------------------------------------------
@@ -5384,6 +5399,45 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
     hr
 }
 
+struct RecentSubmit {
+    q: usize,
+    q_ty: Option<i32>,
+    cl: usize,
+    cmds: Vec<String>,
+}
+static RECENT_SUBMITS: Mutex<std::collections::VecDeque<RecentSubmit>> = Mutex::new(std::collections::VecDeque::new());
+
+fn record_recent_submit(q: usize, q_ty: Option<i32>, cl: *mut c_void) {
+    if super::bind::fault_isolate_secs().is_none() {
+        return;
+    }
+    let cmds = super::bind::dump_cmds(cl);
+    let mut r = RECENT_SUBMITS.lock().unwrap();
+    if r.len() >= 32 {
+        r.pop_front();
+    }
+    r.push_back(RecentSubmit { q, q_ty, cl: cl as usize, cmds });
+}
+
+fn dump_recent_submits() {
+    if super::bind::fault_isolate_secs().is_none() {
+        return;
+    }
+    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let recent = RECENT_SUBMITS.lock().unwrap();
+    crate::xlog_error!("RECENT_SUBMITS ({} lists across all queues):", recent.len());
+    for (idx, rs) in recent.iter().enumerate() {
+        crate::xlog_error!("  recent[{idx:02}] q={:#x} ty={:?} cl={:#x} ({} cmds):", rs.q, rs.q_ty, rs.cl, rs.cmds.len());
+        let start = rs.cmds.len().saturating_sub(8);
+        for (ci, c) in rs.cmds.iter().enumerate().skip(start) {
+            crate::xlog_error!("    [{ci:03}] {c}");
+        }
+    }
+}
+
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
@@ -5392,22 +5446,63 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
-    // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    let mut any_console = false;
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
+            any_console = true;
             mapped.push(pc);
         } else if !super::title_list::push_segments(l, &mut mapped) {
             mapped.push(l);
+        }
+    }
+    // textures in title memory the CPU wrote since: uploaded again first — skip the expensive
+    // kernel GetWriteWatch scan when every list in this batch is empty / barrier / fence-only.
+    if any_console || mapped.iter().any(|&cl| super::bind::has_gpu_work(cl)) {
+        super::title_textures::refresh(this);
+    } else {
+        static SKIPPED_REFRESH: AtomicU64 = AtomicU64::new(0);
+        let k = SKIPPED_REFRESH.fetch_add(1, Ordering::Relaxed) + 1;
+        if k.is_power_of_two() && k >= 256 {
+            crate::xlog_info!("title_textures: skipped {k} GetWriteWatch scans on empty/barrier-only ExecuteCommandLists");
         }
     }
     let isolate = super::bind::fault_isolate_secs().is_some_and(|s| {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_secs() >= s
     });
+    // `PRODIGY_SPLIT_SUBMIT`: `1` splits multi-list ExecuteCommandLists into 1-list calls;
+    // `drain` / `drain:N` throttles Direct lists to depth N; `drain_all` / `drain_all:N`
+    // throttles both Direct and Compute queues (per-queue reusable fence + event).
+    let split_submit: (bool, u64, bool) = {
+        static MODE: std::sync::OnceLock<(bool, u64, bool)> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("PRODIGY_SPLIT_SUBMIT").as_deref() {
+            Ok("0") => (false, 0, false),
+            Ok("1") => (true, 0, false),
+            Ok("drain") => (true, 2, false),
+            Ok("drain_all") => (true, 1, true),
+            Ok(s) if s.starts_with("drain_all:") => {
+                let d = s["drain_all:".len()..].parse::<u64>().unwrap_or(1).max(1);
+                (true, d, true)
+            }
+            Ok(s) if s.starts_with("drain:") => {
+                let d = s["drain:".len()..].parse::<u64>().unwrap_or(2).max(1);
+                (true, d, false)
+            }
+            _ => {
+                // On <= 6 GiB GPUs (e.g. GTX 1060 6 GB), auto-enable Direct queue depth-2
+                // split-submit throttling to prevent overwhelming the GPU with large batches.
+                let vram_mb = adapter_vram_mb();
+                if (1..=6144).contains(&vram_mb) {
+                    (true, 2, false)
+                } else {
+                    (false, 0, false)
+                }
+            }
+        })
+    };
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         if isolate {
@@ -5416,11 +5511,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             let q = ID3D12CommandQueue::from_raw_borrowed(&this);
             for &cl in chunk {
                 f(this, 1, &cl);
+                super::list_x::signal_write64_fences(this, &[cl]);
                 if let (Some(dev), Some(q)) = (dev, q) {
                     if let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
                         if q.Signal(&fence, 1).is_ok() {
                             let t0 = std::time::Instant::now();
-                            while fence.GetCompletedValue() < 1 && t0.elapsed() < std::time::Duration::from_secs(3) {
+                            while fence.GetCompletedValue() < 1 && t0.elapsed() < std::time::Duration::from_secs(2) {
                                 if dev.GetDeviceRemovedReason().is_err() {
                                     break;
                                 }
@@ -5438,12 +5534,84 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
                     }
                 }
             }
+        } else if split_submit.0 {
+            let depth = split_submit.1;
+            let include_compute = split_submit.2;
+            let q = ID3D12CommandQueue::from_raw_borrowed(&this);
+            let q_ty = q.map(|q| q.GetDesc().Type);
+            let should_throttle = depth > 0
+                && matches!(
+                    q_ty,
+                    Some(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        | Some(D3D12_COMMAND_LIST_TYPE_COMPUTE) if include_compute || q_ty == Some(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                );
+            let dev_raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&dev_raw);
+            struct QueueThrottle {
+                fence: ID3D12Fence,
+                event: usize,
+                next: u64,
+            }
+            static THROTTLES: Mutex<Option<HashMap<usize, QueueThrottle>>> = Mutex::new(None);
+            for &cl in chunk {
+                record_recent_submit(this as usize, q_ty.map(|t| t.0), cl);
+                f(this, 1, &cl);
+                // Signal Write64 fences immediately after each list so cross-queue compute
+                // waiters don't deadlock behind throttling waiting on later lists.
+                super::list_x::signal_write64_fences(this, &[cl]);
+                // Skip throttle fence-waits on empty or lightweight intro/menu lists (< 8 GPU ops)
+                // so intro videos and menus stay smooth at full speed.
+                if should_throttle && super::bind::gpu_ops(cl) >= 8 {
+                    if let (Some(dev), Some(q)) = (dev, q) {
+                        let wait_info = {
+                            let mut g = THROTTLES.lock().unwrap();
+                            let map = g.get_or_insert_with(HashMap::new);
+                            let entry = map.entry(this as usize).or_insert_with(|| {
+                                let fence = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).expect("throttle fence");
+                                let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None)
+                                    .map(|h| h.0 as usize)
+                                    .unwrap_or(0);
+                                QueueThrottle { fence, event: ev, next: 0 }
+                            });
+                            entry.next += 1;
+                            let val = entry.next;
+                            if q.Signal(&entry.fence, val).is_ok() && val >= depth {
+                                Some((entry.fence.clone(), entry.event, val - depth + 1))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((fence, ev_raw, target)) = wait_info {
+                            if fence.GetCompletedValue() < target {
+                                let ev = (ev_raw != 0).then_some(windows::Win32::Foundation::HANDLE(ev_raw as *mut c_void));
+                                let _ = crate::gpu::fence::wait(&fence, target, dev, ev, 1_500);
+                            }
+                            if let Err(e) = dev.GetDeviceRemovedReason() {
+                                let cmds = super::bind::dump_cmds(cl);
+                                crate::xlog_error!(
+                                    "SPLIT_SUBMIT FAULT: list {cl:p} on queue {this:p} (ty={:?}) triggered {:#x} ({} recorded cmds):",
+                                    q_ty.map(|t| t.0),
+                                    e.code().0 as u32,
+                                    cmds.len()
+                                );
+                                for (i, c) in cmds.iter().enumerate() {
+                                    crate::xlog_error!("  [{i:03}] {c}");
+                                }
+                                dump_recent_submits();
+                                stop_if_device_removed();
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             f(this, chunk.len() as u32, chunk.as_ptr());
         }
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
-        super::list_x::signal_write64_fences(this, chunk);
+        if !split_submit.0 && !isolate {
+            super::list_x::signal_write64_fences(this, chunk);
+        }
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
@@ -5570,6 +5738,7 @@ pub fn stop_if_device_removed() {
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+        dump_recent_submits();
         log_device_removed();
         let msg = format!("the D3D12 device was removed ({:#x}: {}) – the title is stopped", e.code().0 as u32, e.message());
         crate::xlog_error!("{msg}");

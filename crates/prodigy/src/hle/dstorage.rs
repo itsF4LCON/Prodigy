@@ -909,19 +909,71 @@ unsafe fn write_destination(r: &Request, dest_pages: Option<&[usize]>, payload: 
     let n = r.destination_size as usize;
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
+        // A retail title keeps its page arrays in its own heap/UMA tables and fills/updates
+        // entries after EnqueueRequest (even overwriting a stale previously-allocated page
+        // number that may have been reallocated elsewhere!). Stack-allocated page arrays
+        // (below title UMA / < 0x1_0000_0000) stay as snapshotted at enqueue.
+        let mut late: Vec<usize>;
+        let in_heap = r.destination >= 0x1_0000_0000;
+        let need_reread = in_heap || pages.iter().any(|&p| !crate::hle::kernelx::is_live_physical_page(p));
+        let pages = if need_reread && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
+            let start = std::time::Instant::now();
+            loop {
+                late = (0..pages.len())
+                    .map(|k| {
+                        let cur = (r.destination as *const usize).add(k).read_unaligned();
+                        if crate::hle::kernelx::is_live_physical_page(cur) {
+                            cur
+                        } else if !in_heap && crate::hle::kernelx::is_live_physical_page(pages[k]) {
+                            pages[k]
+                        } else {
+                            cur
+                        }
+                    })
+                    .collect();
+                if late.iter().all(|&p| crate::hle::kernelx::is_live_physical_page(p)) {
+                    if in_heap && late != pages && pages.iter().all(|&p| crate::hle::kernelx::is_live_physical_page(p)) {
+                        static CHANGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let c = CHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if c <= 5 || c.is_power_of_two() {
+                            crate::xlog_info!(
+                                "DirectStorage: heap page array at {:#x} changed after EnqueueRequest (snap={:x?}, live={:x?}, #{c})",
+                                r.destination,
+                                &pages[..pages.len().min(4)],
+                                &late[..late.len().min(4)]
+                            );
+                        }
+                    }
+                    let waited = start.elapsed().as_millis();
+                    if waited > 0 {
+                        static RESCUED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let c = RESCUED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if c <= 5 || c.is_power_of_two() {
+                            crate::xlog_info!("DirectStorage: late physical page populated after {waited} ms ({c} rescued)");
+                        }
+                    }
+                    break;
+                }
+                if start.elapsed() >= std::time::Duration::from_millis(250) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             &late[..]
         } else {
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 5 {
+                crate::xlog_warn!(
+                    "DirectStorage: write_physical_pages failed: dst={:#x} off={:#x} n={} pages={:x?}",
+                    r.destination,
+                    r.destination_page_offset,
+                    n,
+                    &pages[..pages.len().min(8)]
+                );
+            }
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
@@ -1111,8 +1163,27 @@ impl QueueInner {
         FAILED.fetch_add(1, Ordering::Relaxed);
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
+        if e.0 <= 5 {
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let vq = if !request.dest_physical_pages() {
+                unsafe { VirtualQuery(request.destination as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 }
+            } else {
+                false
+            };
+            crate::xlog_warn!(
+                "DirectStorage: a request failed ({hr:#x}, #{}, opts={:#x}, phys={}, dst={:#x}, size={}, vq={vq} state={:#x} prot={:#x}): {} bytes from {}",
+                e.0,
+                request.options,
+                request.dest_physical_pages(),
+                request.destination,
+                request.destination_size,
+                m.State,
+                m.Protect,
+                request.destination_size,
+                file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default()
+            );
+        }
         if e.1.is_none() {
-            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}): {} bytes from {}", request.destination_size, file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default());
             e.1 = Some(FirstError { hr, request, file: file.map(|f| f.path.clone()).unwrap_or_default() });
         }
         unsafe { SetEvent(self.error_event as HANDLE) };

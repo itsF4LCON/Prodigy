@@ -462,6 +462,7 @@ pub fn note_gpu_write(res: usize) {
         if !e.gpu_written {
             e.gpu_written = true;
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+            TEXTURES_GEN.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -632,9 +633,25 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES
+        .lock()
+        .unwrap()
+        .by_res
+        .values()
+        .filter(|e| !e.gpu_written)
+        .map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF))
+        .collect();
+    let tex_count = wanted.len();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
+    {
+        static REBUILDS: AtomicU64 = AtomicU64::new(0);
+        let k = REBUILDS.fetch_add(1, Ordering::Relaxed) + 1;
+        if k == 1 || (k.is_power_of_two() && k >= 64) {
+            let total_mb: usize = computed.iter().map(|r| r.1).sum::<usize>() >> 20;
+            crate::xlog_info!("title_textures: write-watch cache #{k}: {} ranges, {} MB ({tex_count} watched textures)", computed.len(), total_mb);
+        }
+    }
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -752,31 +769,106 @@ unsafe fn refresh_once(queue: *mut c_void) {
         return;
     }
     // textures made since the last submit and those with a written page; a reference each
-    // while they are uploaded
+    // while they are uploaded. Uses a generation-cached sorted `(src, end, res)` index so
+    // submits do O(dirty_runs * log N) instead of scanning all 32K+ textures under TEXTURES lock.
+    type SrcIndex = (Vec<(usize, usize, usize)>, usize);
+    static SRC_INDEX: Mutex<Option<(u64, Arc<SrcIndex>)>> = Mutex::new(None);
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
+        let mut matched: Vec<usize> = Vec::new();
+        if !dirty.is_empty() {
+            let gen = TEXTURES_GEN.load(Ordering::Acquire);
+            let idx: Arc<SrcIndex> = {
+                let mut cache = SRC_INDEX.lock().unwrap();
+                if let Some((g, ref a)) = *cache {
+                    if g == gen {
+                        Arc::clone(a)
+                    } else {
+                        let t = TEXTURES.lock().unwrap();
+                        let mut v: Vec<(usize, usize, usize)> = t
+                            .by_res
+                            .iter()
+                            .filter(|(_, e)| !e.gpu_written)
+                            .map(|(&res, e)| (e.src, e.src + e.tex.size() as usize, res))
+                            .collect();
+                        v.sort_unstable_by_key(|x| x.0);
+                        let max_span = v.iter().map(|&(s, e, _)| e - s).max().unwrap_or(0);
+                        let a = Arc::new((v, max_span));
+                        *cache = Some((gen, Arc::clone(&a)));
+                        a
+                    }
+                } else {
+                    let t = TEXTURES.lock().unwrap();
+                    let mut v: Vec<(usize, usize, usize)> = t
+                        .by_res
+                        .iter()
+                        .filter(|(_, e)| !e.gpu_written)
+                        .map(|(&res, e)| (e.src, e.src + e.tex.size() as usize, res))
+                        .collect();
+                    v.sort_unstable_by_key(|x| x.0);
+                    let max_span = v.iter().map(|&(s, e, _)| e - s).max().unwrap_or(0);
+                    let a = Arc::new((v, max_span));
+                    *cache = Some((gen, Arc::clone(&a)));
+                    a
+                }
+            };
+            let (ref entries, max_span) = *idx;
+            if !entries.is_empty() {
+                let pg = page as usize;
+                let mut i = 0;
+                while i < dirty.len() {
+                    let run_start = dirty[i];
+                    let mut run_end = run_start + pg;
+                    i += 1;
+                    while i < dirty.len() && dirty[i] == run_end {
+                        run_end += pg;
+                        i += 1;
+                    }
+                    let lo = run_start.saturating_sub(max_span);
+                    let mut pos = entries.partition_point(|&(s, _, _)| s < lo);
+                    while pos < entries.len() && entries[pos].0 < run_end {
+                        if entries[pos].1 > run_start {
+                            matched.push(entries[pos].2);
+                        }
+                        pos += 1;
+                    }
+                }
+                if matched.len() > 1 {
+                    matched.sort_unstable();
+                    matched.dedup();
+                }
+            }
+        }
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
+        let mut out = Vec::with_capacity(matched.len());
+        if PENDING.load(Ordering::Relaxed) > 0 {
+            for (&res, e) in t.by_res.iter_mut() {
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
+                    let p = res as *mut c_void;
+                    if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+                        out.push((r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())));
+                    }
+                }
+            }
+        }
+        for res in matched {
+            if let Some(e) = t.by_res.get_mut(&res) {
+                if e.gpu_written || e.pending {
+                    continue;
+                }
+                // Avoid duplicate if already collected as pending above
+                if out.iter().any(|(r, _)| r.as_raw() as usize == res) {
+                    continue;
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
-            })
-            .collect()
+                if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+                    out.push((r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())));
+                }
+            }
+        }
+        out
     });
     upload_all(todo);
 }
@@ -1029,11 +1121,19 @@ const WATCH_GAP: usize = 64 << 20;
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
 /// covers one allocation).
 fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let gap = *GAP.get_or_init(|| {
+        std::env::var("PRODIGY_WATCH_GAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or(WATCH_GAP)
+    });
     wanted.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (a, b) in wanted {
         match merged.last_mut() {
-            Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_add(gap) => last.1 = last.1.max(b),
             _ => merged.push((a, b)),
         }
     }

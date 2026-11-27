@@ -465,7 +465,8 @@ impl Pages {
             return Some(t);
         }
         // If we hit the soft cap and all sampled textures are already evicted, allow overflowing
-        // via CreateHeap so GPU-owned render targets never fail.
+        // via CreateHeap so GPU-owned render targets never fail. On <= 6 GiB GPUs, prefer L0
+        // (system RAM) for overflow pools so local VRAM stays within the hardware budget.
         if at_cap && self.oom_until.is_none_or(|t| now >= t) {
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
@@ -473,9 +474,25 @@ impl Pages {
                 Alignment: 0,
                 Flags: self.heap_flags,
             };
+            let l0 = D3D12_HEAP_DESC {
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                },
+                ..desc
+            };
+            let prefer_l0 = {
+                let vram_mb = super::real::adapter_vram_mb();
+                (1..=6144).contains(&vram_mb)
+            };
+            let (first, second) = if prefer_l0 { (&l0, &desc) } else { (&desc, &l0) };
             let _guard = PagesLockGuard::enter();
             let mut heap: Option<ID3D12Heap> = None;
-            if super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)).is_ok() {
+            if super::title_textures::own_work(|| dev.CreateHeap(first, &mut heap)).is_ok()
+                || super::title_textures::own_work(|| dev.CreateHeap(second, &mut heap)).is_ok()
+            {
                 let heap = heap?;
                 let h = match self.pools.iter().position(|p| p.is_none()) {
                     Some(i) => {

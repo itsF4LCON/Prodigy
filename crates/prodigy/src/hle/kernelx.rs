@@ -855,6 +855,11 @@ fn page_home(page: usize) -> Option<usize> {
     (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
 }
 
+/// Whether `page` currently belongs to a live `AllocateTitlePhysicalPages` allocation.
+pub fn is_live_physical_page(page: usize) -> bool {
+    page_home(page).is_some()
+}
+
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
 /// the coherent window is committed as a whole).
 fn lazy_home(home: usize) -> bool {

@@ -615,11 +615,32 @@ impl State {
             },
             ..desc
         };
-        let mut ok = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)).is_ok()
-            || super::title_textures::own_work(|| self.dev.CreateHeap(&l0, &mut heap)).is_ok();
+        let l1_cap_pools: Option<usize> = {
+            static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+            *CAP.get_or_init(|| {
+                if let Ok(v) = std::env::var("PRODIGY_SPARSE_L0_AFTER_MB") {
+                    let mb: usize = v.trim().parse().ok()?;
+                    return Some(mb / (POOL_TILES as usize * TILE >> 20));
+                }
+                let vram_mb = super::real::adapter_vram_mb();
+                if (1..=6144).contains(&vram_mb) {
+                    // On <= 6 GiB GPUs, keep at most 2560 MiB of sparse pools in local VRAM (L1)
+                    // and place additional pools in L0 (system RAM) so WDDM doesn't oversubscribe L1
+                    // while leaving headroom under the 8 GiB shared GPU memory ceiling on 16 GiB RAM PCs.
+                    Some(2560 / (POOL_TILES as usize * TILE >> 20))
+                } else {
+                    None
+                }
+            })
+        };
+        let live_pools = self.pools.iter().filter(|p| p.is_some()).count();
+        let prefer_l0 = l1_cap_pools.is_some_and(|cap| live_pools >= cap);
+        let (first, second) = if prefer_l0 { (&l0, &desc) } else { (&desc, &l0) };
+        let mut ok = super::title_textures::own_work(|| self.dev.CreateHeap(first, &mut heap)).is_ok()
+            || super::title_textures::own_work(|| self.dev.CreateHeap(second, &mut heap)).is_ok();
         if !ok && super::vram::reclaim_on_oom(self.dev.as_raw(), POOL_TILES as usize * TILE) > 0 {
-            ok = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)).is_ok()
-                || super::title_textures::own_work(|| self.dev.CreateHeap(&l0, &mut heap)).is_ok();
+            ok = super::title_textures::own_work(|| self.dev.CreateHeap(first, &mut heap)).is_ok()
+                || super::title_textures::own_work(|| self.dev.CreateHeap(second, &mut heap)).is_ok();
         }
         if !ok {
             crate::xlog_warn!("sparse windows: no video memory for more tiles (L1+L0 OOM after reclaim)");

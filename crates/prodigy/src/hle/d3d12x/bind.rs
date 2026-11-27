@@ -36,6 +36,43 @@ struct State {
     arena: crate::gpu::uma::Arena,
     /// recent commands recorded on this list (only populated when `PRODIGY_FAULT_ISOLATE` is set)
     cmds: Vec<String>,
+    /// True once this recording has any command that can read CPU-written memory (draw, dispatch,
+    /// copy, resolve, clear UAV, predication, or sparse write). Lists with `false` (empty / barrier
+    /// / fence-only lists) skip the expensive `GetWriteWatch` scan at `ExecuteCommandLists`.
+    has_gpu_work: bool,
+    /// Count of GPU draw/dispatch/copy ops recorded on this list (used to avoid throttling
+    /// lightweight intro/menu/UI lists on <= 6 GiB GPUs).
+    gpu_ops: u32,
+}
+
+#[inline]
+pub(super) fn mark_gpu_work(list: *mut c_void) {
+    with(list, |s| {
+        s.has_gpu_work = true;
+        s.gpu_ops = s.gpu_ops.saturating_add(1);
+    });
+}
+
+#[inline]
+pub(super) fn has_gpu_work(list: *mut c_void) -> bool {
+    let key = list as usize;
+    state_shard(key)
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .map_or(true, |s| s.has_gpu_work)
+}
+
+#[inline]
+pub(super) fn gpu_ops(list: *mut c_void) -> u32 {
+    let key = list as usize;
+    state_shard(key)
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .map_or(u32::MAX, |s| s.gpu_ops)
 }
 
 pub(super) fn fault_isolate_secs() -> Option<u64> {
@@ -114,6 +151,8 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.args_gfx.clear();
         s.rs_gfx = 0;
         s.cmds.clear();
+        s.has_gpu_work = false;
+        s.gpu_ops = 0;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -282,9 +321,18 @@ fn is_root_changing_signature(sig: usize) -> bool {
 /// translated pipeline, on Prodigy's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    mark_gpu_work(this);
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    if super::real::two_pass_of(pso).is_some() {
+        count(DRAWS_SKIPPED);
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect with a two-pass console mesh/GS pipeline ({pso:#x}) skipped");
+        }
+        return;
+    }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (orig_args_off, orig_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -330,7 +378,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
-            note_cmd(this, || format!("ExecuteIndirect(translated gfx={gfx} pso={pso:#x} max={max} args={args:#x}+{args_off:#x} cnt={count_buf:#x}+{count_off:#x})"));
+            note_cmd(this, || {
+                let sh = super::real::pso_shaders(pso).map(|(a, b)| format!("{a:016x}/{b:016x}")).unwrap_or_else(|| "none".into());
+                format!("ExecuteIndirect(translated gfx={gfx} pso={pso:#x} sh={sh} max={max} args={args:#x}+{args_off:#x} cnt={count_buf:#x}+{count_off:#x})")
+            });
             count(if gfx { DRAWS } else { DISPATCHES });
             pc(this, sig, max, args, args_off, count_buf, count_off)
         }
@@ -415,6 +466,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    mark_gpu_work(this);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         note_cmd(this, || format!("DrawInstanced(pso={:#x} v={vertices} inst={instances} fv={first_vertex})", super::pso_async::resolve(with(this, |s| s.pso))));
@@ -433,6 +485,7 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    mark_gpu_work(this);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         note_cmd(this, || format!("DrawIndexedInstanced(pso={:#x} idx={indices} inst={instances} fi={first_index} bv={base_vertex})", super::pso_async::resolve(with(this, |s| s.pso))));
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
@@ -476,6 +529,7 @@ pub(super) fn emulated_mesh_vertex_count(groups: u32, max_primitives: u32) -> u3
 /// Pass 2 either as a hardware `DispatchMesh` or (on older GPUs without Mesh Shaders /
 /// `PRODIGY_EMULATE_MESH=1`) as `IASetPrimitiveTopology(TRIANGLELIST)` + `DrawInstanced`.
 pub(super) unsafe fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    mark_gpu_work(this);
     let pso = with(this, |s| s.pso);
     let real = super::pso_async::resolve_wait(pso);
     if let Some(tp) = super::real::two_pass_of(real) {
@@ -972,6 +1026,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on Prodigy's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    mark_gpu_work(this);
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
@@ -984,9 +1039,28 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
+    static SKIP_CS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let skip_cs = SKIP_CS.get_or_init(|| {
+        std::env::var("PRODIGY_SKIP_CS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    if !skip_cs.is_empty() {
+        if let Some((cs_hash, _)) = super::real::pso_shaders(pso) {
+            if skip_cs.contains(&cs_hash) {
+                count(DISPATCHES_SKIPPED);
+                return;
+            }
+        }
+    }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => {
-            note_cmd(this, || format!("Dispatch(pso={pso:#x} [{x},{y},{z}])"));
+            note_cmd(this, || {
+                let sh = super::real::pso_shaders(pso).map(|(a, b)| format!("{a:016x}/{b:016x}")).unwrap_or_else(|| "none".into());
+                format!("Dispatch(pso={pso:#x} sh={sh} [{x},{y},{z}])")
+            });
             count(DISPATCHES);
         }
         Err(e) => {

@@ -908,11 +908,25 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize, Optio
         p.list.SetGraphicsRootDescriptorTable(0, srv_gpu);
         p.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         p.list.DrawInstanced(3, 1, 0, 0);
-        let b3 = [
-            transition(ov_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT),
-            transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
-        ];
-        p.list.ResourceBarrier(&b3);
+        if due {
+            let b_rd = [
+                transition(ov_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT),
+                transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            ];
+            p.list.ResourceBarrier(&b_rd);
+            let bb_desc = bb.GetDesc();
+            if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
+                dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "screen".into() });
+            }
+            let b3 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)];
+            p.list.ResourceBarrier(&b3);
+        } else {
+            let b3 = [
+                transition(ov_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT),
+                transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
+            ];
+            p.list.ResourceBarrier(&b3);
+        }
     } else {
         let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
         p.list.ResourceBarrier(&b2);
@@ -968,12 +982,19 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize, Optio
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `PRODIGY_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let cur = PRESENTS.load(Ordering::Relaxed);
+    if let Some(after) = *AFTER.get_or_init(|| std::env::var("PRODIGY_FRAME_DUMP_AFTER").ok().and_then(|v| v.parse().ok())) {
+        if cur >= after {
+            return true;
+        }
+    }
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| match std::env::var("PRODIGY_FRAME_DUMP") {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    every > 0 && cur % every == 20.min(every - 1)
 }
 
 /// Frames shown so far.
